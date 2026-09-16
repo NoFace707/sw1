@@ -1,0 +1,83 @@
+@import url("https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700;800&display=swap");
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  margin: 0;
+  font-family: "Sora", "Trebuchet MS", sans-serif;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+.modeler-handle {
+  width: 12px !important;
+  height: 12px !important;
+  border: 2px solid #ffffff !important;
+  background: #2563eb !important;
+  box-shadow: 0 0 0 1px #2563eb;
+  opacity: 0;
+  transition: opacity 120ms ease, transform 120ms ease;
+  z-index: 12;
+}
+
+.modeler-handle:not(.modeler-handle-enabled) {
+  pointer-events: none;
+}
+
+.react-flow__node:hover .modeler-handle-enabled,
+.react-flow__node.selected .modeler-handle-enabled {
+  opacity: 1;
+}
+
+.modeler-handle-enabled:hover {
+  opacity: 1;
+  transform: scale(1.25);
+}
+
+.react-flow__edge.modeler-edge:hover .react-flow__edge-path,
+.react-flow__edge.selected .react-flow__edge-path {
+  stroke: #2563eb;
+}
+
+@media (max-width: 1100px) {
+  .modeler-palette,
+  .modeler-inspector {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    z-index: 20;
+    box-shadow: 0 12px 30px rgb(15 23 42 / 18%);
+  }
+
+  .modeler-palette {
+    left: 0;
+  }
+
+  .modeler-inspector {
+    right: 0;
+  }
+}
+
+.farm-bg {
+  background:
+    radial-gradient(circle at 12% 8%, rgba(20, 184, 166, 0.15) 0, transparent 34%),
+    radial-gradient(circle at 88% 12%, rgba(56, 189, 248, 0.12) 0, transparent 40%),
+    linear-gradient(145deg, #f2fbfb 0%, #fbfeff 48%, #eff7fc 100%);
+}
+
+.hero-shell {
+  background:
+    linear-gradient(120deg, rgba(255, 255, 255, 0.95) 0%, rgba(224, 247, 244, 0.9) 46%, rgba(224, 242, 254, 0.82) 100%),
+    repeating-linear-gradient(
+      -35deg,
+      rgba(20, 184, 166, 0.05),
+      rgba(20, 184, 166, 0.05) 18px,
+      rgba(255, 255, 255, 0.1) 18px,
+      rgba(255, 255, 255, 0.1) 36px
+    );
+}
+

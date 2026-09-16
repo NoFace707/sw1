@@ -1,0 +1,82 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-app_db}
+      POSTGRES_USER: ${POSTGRES_USER:-app_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-app_password}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-app_user} -d ${POSTGRES_DB:-app_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build: ./backend
+    command: python manage.py runserver 0.0.0.0:8000
+    restart: unless-stopped
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-app_db}
+      POSTGRES_USER: ${POSTGRES_USER:-app_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-app_password}
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:-development-only-secret-key-change-before-production-2026}
+      DJANGO_DEBUG: ${DJANGO_DEBUG:-True}
+      DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:-localhost,127.0.0.1,backend}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:5173,http://localhost:5180}
+      JWT_ACCESS_LIFETIME_SECONDS: ${JWT_ACCESS_LIFETIME_SECONDS:-3600}
+      JWT_REFRESH_LIFETIME_SECONDS: ${JWT_REFRESH_LIFETIME_SECONDS:-604800}
+      # Container-to-container traffic must use the Compose service name. The
+      # root .env keeps localhost values for running Django directly on the host.
+      REDIS_URL: redis://redis:6379/0
+      REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS: ${REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS:-5}
+      REDIS_HEALTH_CHECK_INTERVAL_SECONDS: ${REDIS_HEALTH_CHECK_INTERVAL_SECONDS:-30}
+      CHANNEL_LAYERS_BACKEND: ${CHANNEL_LAYERS_BACKEND:-channels_redis.core.RedisChannelLayer}
+      DJANGO_CACHE_BACKEND: ${DJANGO_CACHE_BACKEND:-django.core.cache.backends.redis.RedisCache}
+      DJANGO_CACHE_LOCATION: redis://redis:6379/1
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "${DJANGO_PORT:-8000}:8000"
+    volumes:
+      - ./backend/src:/app
+
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    environment:
+      VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:${DJANGO_PORT:-8000}}
+      VITE_ENABLE_EA_INTERCHANGE: ${VITE_ENABLE_EA_INTERCHANGE:-false}
+      CHOKIDAR_USEPOLLING: "true"
+    ports:
+      - "${REACT_PORT:-5180}:5173"
+    volumes:
+      - ./frontend:/usr/src/app
+      - /usr/src/app/node_modules
+
+volumes:
+  postgres_data:
+  redis_data:

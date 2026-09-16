@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.venv/
+
+# Node
+node_modules/
+dist/
+
+# Env files
+.env
+*.env.local
+
+# Local uploads / generated media
+backend/src/media/
+backend/src/config/firebase-service-account*.json
+backend/src/config/*firebase-adminsdk*.json
+run-logs/
+.local-pgdata/
+
+# VS Code
+.vscode/
+
+# OS
+Thumbs.db
+
+# Flutter
+**/.dart_tool/
+**/build/
+*.hprof
+
+# Claude Code
+CLAUDE.md
+
+# Bases de datos locales
+*.sqlite3
+
+# Reportes de pruebas de Frontend (Playwright)
+**/playwright-report/
+**/test-results/
