@@ -1,7 +1,11 @@
 import asyncio
+import http.client
+import io
 import uuid
 import json
+import urllib.error
 from datetime import timedelta
+from pathlib import Path
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
@@ -14,13 +18,16 @@ from rest_framework.test import APIClient
 from asgiref.sync import async_to_sync
 from asgiref.testing import ApplicationCommunicator
 from django.core.cache import cache
+from django.core.files.uploadedfile import SimpleUploadedFile
 
 from .consumers import ProjectConsumer
-from .models import Diagram, DiagramNode, InviteCode, ModelOperation, Project, ProjectMembership, ProjectSnapshot, UmlElement
+from .models import Diagram, DiagramEdge, DiagramNode, InviteCode, ModelOperation, Project, ProjectMembership, ProjectSnapshot, UmlElement, UmlPackage, UmlRelationship
 from .serializers import DiagramEdgeSerializer, DiagramNodeSerializer
 from .interchange import exchange_mapping, parse_exchange, write_exchange
 from .interchange_compare import compare_exchange_payloads, semantic_projection
 from .registry import DIAGRAM_DEFINITIONS, DIAGRAM_TYPES
+from .expert_rules import EXPERT_RULES_VERSION
+from .local_model_manifest import QWEN_MODEL_REVISION
 
 
 User = get_user_model()
@@ -56,6 +63,143 @@ class ModelingApiTests(TestCase):
         response = self.client.get("/api/modeling/registry/")
         for diagram_type, metaclasses in expected.items():
             self.assertTrue(metaclasses.issubset(set(response.data["diagrams"][diagram_type]["elements"])))
+
+    def test_expert_rules_exposes_versioned_offline_payload(self):
+        response = self.client.get("/api/modeling/expert-rules/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["version"], EXPERT_RULES_VERSION)
+        self.assertEqual(response.data["registry_version"], "uml-2.5.1-subset-2")
+        self.assertEqual(len(response.data["checksum"]), 64)
+        self.assertTrue(response.data["rules"])
+
+    def test_local_qwen_manifest_is_pinned_and_integrity_protected(self):
+        response = self.client.get("/api/modeling/ai/local-model/manifest/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["version"], QWEN_MODEL_REVISION)
+        self.assertEqual(response.data["byte_size"], 1117320768)
+        self.assertEqual(response.data["sha256"], "cc324af070c2ecbfd324a30884d2f951a7ff756aba85cb811a6ec436933bb046")
+        self.assertEqual(len(response.data["manifest_checksum"]), 64)
+
+    @override_settings(
+        AI_TRANSCRIPTION_BACKEND="remote",
+        AI_TRANSCRIPTION_BASE_URL="https://speech.test/v1",
+        AI_TRANSCRIPTION_API_KEY="speech-secret",
+        AI_TRANSCRIPTION_MODEL="whisper-1",
+    )
+    @patch("modeling.transcription.urllib_request.urlopen")
+    def test_voice_transcription_is_authenticated_forwarded_and_does_not_mutate_project(self, mocked_urlopen):
+        class ProviderResponse:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def read(self): return json.dumps({"text": "crea una clase Cliente"}).encode()
+
+        mocked_urlopen.return_value = ProviderResponse()
+        project = self.create_project()
+        response = self.client.post(
+            f"/api/modeling/projects/{project['id']}/ai/transcriptions/",
+            {"audio": SimpleUploadedFile("instruction.webm", b"test-audio", content_type="audio/webm"), "language": "es"},
+            format="multipart",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["text"], "crea una clase Cliente")
+        self.assertEqual(Project.objects.get(pk=project["id"]).revision, 0)
+        sent = mocked_urlopen.call_args.args[0]
+        self.assertEqual(sent.full_url, "https://speech.test/v1/audio/transcriptions")
+        self.assertEqual(sent.headers["Authorization"], "Bearer speech-secret")
+        self.assertIn(b'name="file"; filename="instruction.webm"', sent.data)
+        self.assertIn(b'name="model"', sent.data)
+
+    @override_settings(
+        AI_TRANSCRIPTION_BACKEND="remote",
+        AI_TRANSCRIPTION_BASE_URL="",
+        AI_TRANSCRIPTION_API_KEY="",
+    )
+    def test_voice_transcription_reports_missing_configuration(self):
+        project = self.create_project()
+        response = self.client.post(
+            f"/api/modeling/projects/{project['id']}/ai/transcriptions/",
+            {"audio": SimpleUploadedFile("instruction.webm", b"audio", content_type="audio/webm")},
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("AI_TRANSCRIPTION_API_KEY", response.data["detail"])
+
+    @override_settings(
+        AI_TRANSCRIPTION_BACKEND="remote",
+        AI_TRANSCRIPTION_BASE_URL="https://speech.test/v1",
+        AI_TRANSCRIPTION_API_KEY="speech-secret",
+        AI_TRANSCRIPTION_MAX_BYTES=4,
+    )
+    def test_voice_transcription_rejects_unsupported_or_oversized_audio(self):
+        project = self.create_project()
+        unsupported = self.client.post(
+            f"/api/modeling/projects/{project['id']}/ai/transcriptions/",
+            {"audio": SimpleUploadedFile("instruction.txt", b"abc", content_type="text/plain")},
+            format="multipart",
+        )
+        oversized = self.client.post(
+            f"/api/modeling/projects/{project['id']}/ai/transcriptions/",
+            {"audio": SimpleUploadedFile("instruction.webm", b"12345", content_type="audio/webm")},
+            format="multipart",
+        )
+        self.assertEqual(unsupported.status_code, 400)
+        self.assertEqual(oversized.status_code, 413)
+
+    @override_settings(
+        AI_TRANSCRIPTION_BACKEND="remote",
+        AI_TRANSCRIPTION_BASE_URL="https://speech.test/v1",
+        AI_TRANSCRIPTION_API_KEY="speech-secret",
+    )
+    def test_voice_transcription_does_not_reveal_projects_to_non_members(self):
+        project = self.create_project()
+        self.client.force_authenticate(self.other)
+        response = self.client.post(
+            f"/api/modeling/projects/{project['id']}/ai/transcriptions/",
+            {"audio": SimpleUploadedFile("instruction.webm", b"audio", content_type="audio/webm")},
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, 404)
+
+    @override_settings(
+        AI_TRANSCRIPTION_BACKEND="local",
+        AI_TRANSCRIPTION_LOCAL_MODEL="base",
+    )
+    @patch("modeling.transcription._get_local_model")
+    def test_voice_transcription_uses_local_whisper_without_api_key_and_cleans_temp_file(
+        self, mocked_model
+    ):
+        class Segment:
+            text = " crea una clase Cliente "
+
+        temporary_paths = []
+
+        def fake_transcribe(path, **kwargs):
+            temporary_paths.append(path)
+            self.assertTrue(Path(path).exists())
+            return [Segment()], object()
+
+        mocked_model.return_value.transcribe.side_effect = fake_transcribe
+        project = self.create_project()
+        response = self.client.post(
+            f"/api/modeling/projects/{project['id']}/ai/transcriptions/",
+            {
+                "audio": SimpleUploadedFile(
+                    "instruction.m4a",
+                    b"local-audio",
+                    content_type="audio/mp4a-latm",
+                )
+            },
+            format="multipart",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["text"], "crea una clase Cliente")
+        self.assertEqual(response.data["model"], "local:base")
+        mocked_model.return_value.transcribe.assert_called_once()
+        self.assertEqual(len(temporary_paths), 1)
+        self.assertFalse(Path(temporary_paths[0]).exists())
+        self.assertEqual(Project.objects.get(pk=project["id"]).revision, 0)
 
     def test_exchange_mapping_covers_registry_metaclasses_relationships_and_properties(self):
         mapping = exchange_mapping()
@@ -177,6 +321,18 @@ class ModelingApiTests(TestCase):
         project = self.create_project()
         with self.assertRaises(ProtectedError):
             self.owner.delete()
+
+    def test_only_owner_can_delete_a_project(self):
+        project = self.create_project()
+        ProjectMembership.objects.create(project_id=project["id"], user=self.other, role="editor")
+        self.client.force_authenticate(self.other)
+        denied = self.client.delete(f"/api/modeling/projects/{project['id']}/")
+        self.assertEqual(denied.status_code, 403)
+        self.assertTrue(Project.objects.filter(pk=project["id"]).exists())
+        self.client.force_authenticate(self.owner)
+        deleted = self.client.delete(f"/api/modeling/projects/{project['id']}/")
+        self.assertEqual(deleted.status_code, 204)
+        self.assertFalse(Project.objects.filter(pk=project["id"]).exists())
 
     def test_invalid_element_is_rejected_without_mutation(self):
         project = self.create_project()
@@ -498,6 +654,47 @@ class ModelingApiTests(TestCase):
         self.assertEqual(copied.status_code, 201)
         self.assertEqual(UmlElement.objects.filter(project=project["id"]).count(), 2)
 
+    def test_exchange_overlay_adds_objects_to_target_diagram_without_replacing_existing_views(self):
+        project = self.create_project()
+        existing = UmlElement.objects.create(project_id=project["id"], metaclass="Class", name="Existente", created_by=self.owner)
+        target = Diagram.objects.create(project_id=project["id"], name="Diagrama actual", diagram_type="class", created_by=self.owner)
+        existing_node = DiagramNode.objects.create(diagram=target, element=existing, x=730, y=410)
+        xml = '<xmi:XMI xmlns:xmi="http://www.omg.org/spec/XMI/20131001" xmlns:uml="http://www.omg.org/spec/UML/20131001"><uml:Model xmi:id="m"><uml:Class xmi:id="c" name="Importada"/><uml:Diagram xmi:id="d" name="Diagrama externo" /></uml:Model></xmi:XMI>'
+
+        preview = self.client.post(
+            f"/api/modeling/projects/{project['id']}/interchange/import/",
+            {"xml": xml, "mode": "overlay", "target_diagram_id": str(target.id), "preview": True},
+            format="json",
+        )
+        self.assertEqual(preview.status_code, 200)
+        self.assertEqual(preview.data["target_diagram"]["id"], str(target.id))
+        self.assertEqual(DiagramNode.objects.filter(diagram=target).count(), 1)
+
+        imported = self.client.post(
+            f"/api/modeling/projects/{project['id']}/interchange/import/",
+            {"xml": xml, "mode": "overlay", "target_diagram_id": str(target.id)},
+            format="json",
+        )
+        self.assertEqual(imported.status_code, 201)
+        self.assertEqual(Diagram.objects.filter(project_id=project["id"]).count(), 1)
+        self.assertEqual(DiagramNode.objects.filter(diagram=target).count(), 2)
+        existing_node.refresh_from_db()
+        self.assertEqual((existing_node.x, existing_node.y), (730, 410))
+        self.assertTrue(DiagramNode.objects.filter(diagram=target, element__name="Importada").exists())
+
+    def test_exchange_overlay_rejects_a_diagram_from_another_project(self):
+        project = self.create_project()
+        other_project = self.create_project()
+        foreign_diagram = Diagram.objects.create(project_id=other_project["id"], name="Ajeno", diagram_type="class", created_by=self.owner)
+        xml = '<xmi:XMI xmlns:xmi="http://www.omg.org/spec/XMI/20131001" xmlns:uml="http://www.omg.org/spec/UML/20131001"><uml:Model xmi:id="m"><uml:Class xmi:id="c" name="Importada"/></uml:Model></xmi:XMI>'
+        response = self.client.post(
+            f"/api/modeling/projects/{project['id']}/interchange/import/",
+            {"xml": xml, "mode": "overlay", "target_diagram_id": str(foreign_diagram.id)},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(UmlElement.objects.filter(project_id=project["id"]).count(), 0)
+
     @override_settings(MAX_PROJECT_ELEMENTS=1)
     def test_project_element_limit_returns_clear_error(self):
         project = self.create_project()
@@ -521,10 +718,52 @@ class ModelingApiTests(TestCase):
         self.client.post(f"/api/modeling/projects/{project['id']}/elements/", {"metaclass": "Class", "name": "Dos"}, format="json")
         self.assertLessEqual(ProjectSnapshot.objects.filter(project=project["id"], reason="periodic").count(), 1)
 
+    @override_settings(AI_BASE_URL="")
     def test_ai_is_disabled_without_provider_and_does_not_mutate(self):
         project = self.create_project()
         response = self.client.post(f"/api/modeling/projects/{project['id']}/ai/proposals/", {"prompt": "crea una clase"}, format="json")
         self.assertEqual(response.status_code, 503)
+        self.assertEqual(Project.objects.get(pk=project["id"]).revision, 0)
+
+    @override_settings(AI_BASE_URL="https://api.xkiro.com/v1", AI_API_KEY="")
+    def test_xkiro_without_key_returns_recoverable_configuration_error(self):
+        project = self.create_project()
+        response = self.client.post(
+            f"/api/modeling/projects/{project['id']}/ai/proposals/",
+            {"prompt": "crea una clase"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("AI_API_KEY", response.data["detail"])
+        self.assertEqual(Project.objects.get(pk=project["id"]).revision, 0)
+
+    @override_settings(
+        AI_BASE_URL="https://api.xkiro.com/v1",
+        AI_API_KEY="secret-that-must-not-leak",
+    )
+    @patch("modeling.ai.urllib.request.urlopen")
+    def test_xkiro_http_error_preserves_safe_provider_diagnostic(self, mocked_urlopen):
+        mocked_urlopen.side_effect = urllib.error.HTTPError(
+            "https://api.xkiro.com/v1/chat/completions",
+            403,
+            "Forbidden",
+            {},
+            io.BytesIO(json.dumps({
+                "error": {"message": "API key is inactive"},
+            }).encode()),
+        )
+        project = self.create_project()
+
+        response = self.client.post(
+            f"/api/modeling/projects/{project['id']}/ai/proposals/",
+            {"prompt": "crea una clase"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("HTTP 403", response.data["detail"])
+        self.assertIn("API key is inactive", response.data["detail"])
+        self.assertNotIn("secret-that-must-not-leak", response.data["detail"])
         self.assertEqual(Project.objects.get(pk=project["id"]).revision, 0)
 
     def test_owner_can_manage_member_role_and_revoke_invite(self):
@@ -568,6 +807,971 @@ class ModelingApiTests(TestCase):
         self.assertTrue(ProjectSnapshot.objects.filter(project=project["id"], reason="before_ai").exists())
         sent_payload = json.loads(mocked_urlopen.call_args.args[0].data.decode())
         self.assertNotIn("secret-for-test", json.dumps(sent_payload))
+
+    @override_settings(AI_BASE_URL="http://provider.test")
+    @patch("modeling.ai.urllib.request.urlopen")
+    def test_ai_normalizes_path_value_update_and_preserves_other_properties(self, mocked_urlopen):
+        project = self.create_project()
+        element = self.client.post(
+            f"/api/modeling/projects/{project['id']}/elements/",
+            {
+                "metaclass": "Class",
+                "name": "Cliente",
+                "properties": {
+                    "attributes": ["+ nombre: String"],
+                    "presentation": "classifier-with-attributes",
+                },
+            },
+            format="json",
+        )
+
+        class ProviderResponse:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def read(self):
+                return json.dumps({
+                    "operations": [{
+                        "id": "add-email",
+                        "entity_type": "UmlElement",
+                        "entity_id": element.data["id"],
+                        "action": "update",
+                        "path": "properties.attributes",
+                        "value": ["+ nombre: String", "+ email: String"],
+                    }],
+                    "warnings": [],
+                    "questions": [],
+                    "assumptions": [],
+                    "diagnostics": [],
+                }).encode()
+
+        mocked_urlopen.return_value = ProviderResponse()
+        proposal = self.client.post(
+            f"/api/modeling/projects/{project['id']}/ai/proposals/",
+            {"prompt": "Agrega email String a Cliente"},
+            format="json",
+        )
+
+        self.assertEqual(proposal.status_code, 201)
+        operation = proposal.data["proposal"]["operations"][0]
+        self.assertEqual(
+            operation["value"],
+            {"properties": {"attributes": ["+ nombre: String", "+ email: String"]}},
+        )
+        self.assertEqual(proposal.data["proposal"]["diagnostics"][0]["severity"], "info")
+        applied = self.client.post(
+            f"/api/modeling/projects/{project['id']}/ai/proposals/{proposal.data['id']}/apply/",
+            {},
+            format="json",
+        )
+        self.assertEqual(applied.status_code, 200)
+        saved = UmlElement.objects.get(pk=element.data["id"])
+        self.assertEqual(saved.properties["attributes"], ["+ nombre: String", "+ email: String"])
+        self.assertEqual(saved.properties["presentation"], "classifier-with-attributes")
+        self.assertTrue(ModelOperation.objects.filter(
+            project_id=project["id"], entity_type="UmlElement", path="properties.attributes", origin="ai"
+        ).exists())
+
+    @override_settings(AI_BASE_URL="http://provider.test")
+    @patch("modeling.ai.urllib.request.urlopen")
+    def test_ai_repairs_temporary_ids_when_adding_an_element_to_a_diagram(self, mocked_urlopen):
+        project = self.create_project()
+        diagram = self.client.post(
+            f"/api/modeling/projects/{project['id']}/diagrams/",
+            {"name": "Clases", "diagram_type": "class"},
+            format="json",
+        )
+        temporary_element_id = "a1b2c3d4-e5f6-7890-g1h2-i3j4k5l6m7n8"
+
+        class ProviderResponse:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def read(self):
+                return json.dumps({
+                    "operations": [
+                        {
+                            "id": temporary_element_id,
+                            "entity_type": "UmlElement",
+                            "action": "create",
+                            "value": {
+                                "metaclass": "Class",
+                                "name": "Producto",
+                                "properties": {"attributes": ["+ nombre: String"]},
+                                "diagram_nodes": [{"diagram_id": diagram.data["id"]}],
+                            },
+                        },
+                        {
+                            "id": "create-product-node",
+                            "entity_type": "DiagramNode",
+                            "action": "create",
+                            "depends_on": [temporary_element_id],
+                            "value": {
+                                "diagram_id": diagram.data["id"],
+                                "element_id": "11111111-2222-4333-8444-555555555555",
+                                "x": 200,
+                                "y": 120,
+                                "width": 180,
+                                "height": 100,
+                                "properties": {},
+                            },
+                        },
+                    ],
+                    "warnings": [],
+                }).encode()
+
+        mocked_urlopen.return_value = ProviderResponse()
+        proposal = self.client.post(
+            f"/api/modeling/projects/{project['id']}/ai/proposals/",
+            {"prompt": "Agrega Producto al diagrama", "diagram_id": diagram.data["id"]},
+            format="json",
+        )
+
+        self.assertEqual(proposal.status_code, 201)
+        operations = proposal.data["proposal"]["operations"]
+        element_id = operations[0]["entity_id"]
+        self.assertEqual(str(uuid.UUID(element_id)), element_id)
+        self.assertNotIn("diagram_nodes", operations[0]["value"])
+        self.assertEqual(operations[1]["value"]["element"], element_id)
+        self.assertIn(operations[0]["id"], operations[1]["depends_on"])
+
+        applied = self.client.post(
+            f"/api/modeling/projects/{project['id']}/ai/proposals/{proposal.data['id']}/apply/",
+            {},
+            format="json",
+        )
+        self.assertEqual(applied.status_code, 200)
+        self.assertTrue(UmlElement.objects.filter(pk=element_id, name="Producto").exists())
+        self.assertTrue(DiagramNode.objects.filter(diagram_id=diagram.data["id"], element_id=element_id).exists())
+
+    @override_settings(AI_BASE_URL="http://provider.test")
+    @patch("modeling.ai.urllib.request.urlopen")
+    def test_ai_expands_two_classes_and_applies_many_to_many_relationship(self, mocked_urlopen):
+        project = self.create_project()
+        diagram = self.client.post(
+            f"/api/modeling/projects/{project['id']}/diagrams/",
+            {"name": "Clases", "diagram_type": "class"},
+            format="json",
+        )
+
+        class ProviderResponse:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def read(self):
+                return json.dumps({
+                    "operations": [
+                        {
+                            "id": "many-to-many",
+                            "entity_type": "UmlRelationship",
+                            "action": "create",
+                            "value": json.dumps({
+                                "relationship_type": "Association",
+                                "source": "Persona",
+                                "target": "Mascota",
+                                "properties": {"multiplicity": {"source": "*", "target": "*"}},
+                            }),
+                        },
+                        {
+                            "id": "classes",
+                            "entity_type": "UmlElement",
+                            "action": "create",
+                            "value": [
+                                {"metaclass": "Class", "name": "Persona", "properties": {"attributes": ["+ nombre: String", "+ edad: Integer", "+ sexo: String"]}},
+                                {"metaclass": "Class", "name": "Mascota", "properties": {"attributes": ["+ nombre: String", "+ edad: Integer", "+ sexo: String"]}},
+                            ],
+                        },
+                        {
+                            "id": "nodes",
+                            "entity_type": "DiagramNode",
+                            "action": "create",
+                            "value": [
+                                {"diagram": diagram.data["id"], "element": "Persona", "x": 120, "y": 160, "width": 200, "height": 130, "properties": {}},
+                                {"diagram": diagram.data["id"], "element": "Mascota", "x": 480, "y": 160, "width": 200, "height": 130, "properties": {}},
+                            ],
+                        },
+                        {
+                            "id": "relationship-edge",
+                            "entity_type": "DiagramEdge",
+                            "action": "create",
+                            "depends_on": ["nodes:1", "nodes:2", "many-to-many"],
+                            "value": {
+                                "diagram": diagram.data["id"],
+                                "relationship": "many-to-many",
+                                "source_node": "nodes:1",
+                                "target_node": "nodes:2",
+                                "properties": {"presentation": {"label": "* ↔ *"}},
+                            },
+                        },
+                    ],
+                    "warnings": [],
+                }).encode()
+
+        mocked_urlopen.return_value = ProviderResponse()
+        proposal = self.client.post(
+            f"/api/modeling/projects/{project['id']}/ai/proposals/",
+            {
+                "prompt": "Crea Persona y Mascota con nombre, edad y sexo y relación muchos a muchos",
+                "diagram_id": diagram.data["id"],
+            },
+            format="json",
+        )
+
+        self.assertEqual(proposal.status_code, 201)
+        operations = proposal.data["proposal"]["operations"]
+        self.assertEqual(len(operations), 6)
+        self.assertEqual([item["entity_type"] for item in operations[:2]], ["UmlElement", "UmlElement"])
+        applied = self.client.post(
+            f"/api/modeling/projects/{project['id']}/ai/proposals/{proposal.data['id']}/apply/",
+            {},
+            format="json",
+        )
+
+        self.assertEqual(applied.status_code, 200)
+        elements = UmlElement.objects.filter(project_id=project["id"], name__in=["Persona", "Mascota"])
+        self.assertEqual(elements.count(), 2)
+        self.assertTrue(all(len(item.properties["attributes"]) == 3 for item in elements))
+        relationship = UmlRelationship.objects.get(project_id=project["id"], relationship_type="Association")
+        self.assertEqual(relationship.properties["multiplicity"], {"source": "*", "target": "*"})
+        self.assertEqual(DiagramNode.objects.filter(diagram_id=diagram.data["id"], element__in=elements).count(), 2)
+        self.assertTrue(DiagramEdge.objects.filter(diagram_id=diagram.data["id"], relationship=relationship).exists())
+
+    @override_settings(AI_BASE_URL="http://provider.test")
+    @patch("modeling.ai.urllib.request.urlopen")
+    def test_ai_normalizes_provider_aliases_and_structured_class_attributes(self, mocked_urlopen):
+        project = self.create_project()
+        diagram = self.client.post(
+            f"/api/modeling/projects/{project['id']}/diagrams/",
+            {"name": "Clases", "diagram_type": "class"},
+            format="json",
+        )
+        persona_id = str(uuid.uuid4())
+        mascota_id = str(uuid.uuid4())
+        relationship_id = str(uuid.uuid4())
+
+        class ProviderResponse:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def read(self):
+                return json.dumps({
+                    "operations": [
+                        {"id": "op1", "entity_type": "UmlElement", "entity_id": persona_id, "action": "create", "value": {"meta_class": "Class", "name": "Persona", "properties": {"attributes": [{"name": "nombre", "type": "String"}, {"name": "edad", "type": "Integer"}]}}},
+                        {"id": "op2", "entity_type": "DiagramNode", "action": "create", "depends_on": ["op1"], "value": {"diagram_id": diagram.data["id"], "element_ref": persona_id}},
+                        {"id": "op3", "entity_type": "UmlElement", "entity_id": mascota_id, "action": "create", "value": {"meta_class": "Class", "name": "Mascota", "properties": {"attributes": [{"name": "especie", "type": "String"}, {"name": "peso", "type": "Float"}]}}},
+                        {"id": "op4", "entity_type": "DiagramNode", "action": "create", "depends_on": ["op3"], "value": {"diagram_id": diagram.data["id"], "element_ref": mascota_id}},
+                        {"id": "op5", "entity_type": "UmlRelationship", "entity_id": relationship_id, "action": "create", "depends_on": ["op1", "op3"], "value": {"relationship_type": "Association", "source_element_ref": persona_id, "target_element_ref": mascota_id, "properties": {"multiplicity": {"source": "*", "target": "*"}}}},
+                        {"id": "op6", "entity_type": "DiagramEdge", "action": "create", "depends_on": ["op2", "op4", "op5"], "value": {"diagram_id": diagram.data["id"], "relationship_ref": relationship_id, "source_node_ref": persona_id, "target_node_ref": mascota_id}},
+                    ],
+                    "warnings": [], "questions": [], "assumptions": [], "diagnostics": [],
+                }).encode()
+
+        mocked_urlopen.return_value = ProviderResponse()
+        proposal = self.client.post(
+            f"/api/modeling/projects/{project['id']}/ai/proposals/",
+            {"prompt": "Crea Persona y Mascota y relaciónalas de muchos a muchos", "diagram_id": diagram.data["id"]},
+            format="json",
+        )
+        self.assertEqual(proposal.status_code, 201)
+        first = proposal.data["proposal"]["operations"][0]
+        self.assertEqual(first["value"]["metaclass"], "Class")
+        self.assertEqual(first["value"]["properties"]["attributes"], ["+ nombre: String", "+ edad: Integer"])
+
+        applied = self.client.post(
+            f"/api/modeling/projects/{project['id']}/ai/proposals/{proposal.data['id']}/apply/",
+            {},
+            format="json",
+        )
+        self.assertEqual(applied.status_code, 200)
+        self.assertEqual(UmlElement.objects.filter(project_id=project["id"], metaclass="Class").count(), 2)
+        relationship = UmlRelationship.objects.get(project_id=project["id"])
+        self.assertEqual(relationship.properties["multiplicity"], {"source": "*", "target": "*"})
+        self.assertTrue(DiagramEdge.objects.filter(diagram_id=diagram.data["id"], relationship=relationship).exists())
+
+    @override_settings(AI_BASE_URL="http://provider.test")
+    @patch("modeling.ai.urllib.request.urlopen")
+    def test_ai_normalizes_closed_metaclass_variants_but_rejects_unknown_values(self, mocked_urlopen):
+        class ProviderResponse:
+            def __init__(self, operations): self.operations = operations
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def read(self):
+                return json.dumps({"operations": self.operations, "warnings": [], "questions": [], "assumptions": [], "diagnostics": []}).encode()
+
+        project = self.create_project()
+        mocked_urlopen.return_value = ProviderResponse([
+            {"id": "first", "entity_type": "uml_element", "action": "create", "value": {"metaclass": "UML::class", "name": "Primera"}},
+            {"id": "second", "entity_type": "UmlElement", "action": "create", "value": {"type": "Clase", "name": "Segunda"}},
+        ])
+        proposal = self.client.post(
+            f"/api/modeling/projects/{project['id']}/ai/proposals/",
+            {"prompt": "Crea dos clases"},
+            format="json",
+        )
+        self.assertEqual(proposal.status_code, 201)
+        self.assertEqual([item["value"]["metaclass"] for item in proposal.data["proposal"]["operations"]], ["Class", "Class"])
+
+        mocked_urlopen.return_value = ProviderResponse([
+            {"id": "invalid", "entity_type": "UmlElement", "action": "create", "value": {"metaclass": "InventedMetaClass", "name": "Inválida"}},
+        ])
+        rejected = self.client.post(
+            f"/api/modeling/projects/{project['id']}/ai/proposals/",
+            {"prompt": "Crea otra clase"},
+            format="json",
+        )
+        self.assertEqual(rejected.status_code, 503)
+        self.assertIn("InventedMetaClass", rejected.data["detail"])
+
+    @override_settings(AI_BASE_URL="http://provider.test")
+    @patch("modeling.ai.urllib.request.urlopen")
+    def test_ai_completes_and_applies_a_three_class_many_to_many_graph(self, mocked_urlopen):
+        project = self.create_project()
+        diagram = self.client.post(
+            f"/api/modeling/projects/{project['id']}/diagrams/",
+            {"name": "Clases", "diagram_type": "class"},
+            format="json",
+        )
+        element_ids = [str(uuid.uuid4()) for _ in range(3)]
+        relationship_ids = [str(uuid.uuid4()) for _ in range(3)]
+        names = ["Estudiante", "Curso", "Profesor"]
+        pairs = [(0, 1), (1, 2), (0, 2)]
+        operations = []
+        for index, (element_id, name) in enumerate(zip(element_ids, names), start=1):
+            element_operation = f"element-{index}"
+            node_operation = f"node-{index}"
+            operations.extend([
+                {"id": element_operation, "entity_type": "UmlElement", "entity_id": element_id, "action": "create", "value": {"metaclass": "Class", "name": name, "properties": {"attributes": ["+ id: String"]}}},
+                {"id": node_operation, "entity_type": "DiagramNode", "action": "create", "depends_on": [element_operation], "value": {"element": element_id}},
+            ])
+        for index, ((source_index, target_index), relationship_id) in enumerate(zip(pairs, relationship_ids), start=1):
+            relationship_operation = f"relationship-{index}"
+            operations.extend([
+                {"id": relationship_operation, "entity_type": "UmlRelationship", "entity_id": relationship_id, "action": "create", "depends_on": [f"element-{source_index + 1}", f"element-{target_index + 1}"], "value": {"relationship_type": "Association", "source": element_ids[source_index], "target": element_ids[target_index], "properties": {"multiplicity": {"source": "*", "target": "*"}}}},
+                {"id": f"edge-{index}", "entity_type": "DiagramEdge", "action": "create", "depends_on": [f"node-{source_index + 1}", f"node-{target_index + 1}", relationship_operation], "value": {"relationship": relationship_id, "source_node": f"<node_{source_index}>", "target_node": f"<node_{target_index}>"}},
+            ])
+
+        class ProviderResponse:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def read(self):
+                return json.dumps({"operations": operations, "warnings": [], "questions": [], "assumptions": [], "diagnostics": []}).encode()
+
+        mocked_urlopen.return_value = ProviderResponse()
+        proposal = self.client.post(
+            f"/api/modeling/projects/{project['id']}/ai/proposals/",
+            {"prompt": "Crea tres clases relacionadas muchos a muchos", "diagram_id": diagram.data["id"]},
+            format="json",
+        )
+        self.assertEqual(proposal.status_code, 201)
+        normalized = proposal.data["proposal"]["operations"]
+        nodes = [item for item in normalized if item["entity_type"] == "DiagramNode"]
+        edges = [item for item in normalized if item["entity_type"] == "DiagramEdge"]
+        self.assertEqual(len(nodes), 3)
+        self.assertEqual(len(edges), 3)
+        self.assertTrue(all(item["value"]["diagram"] == diagram.data["id"] for item in nodes + edges))
+        self.assertTrue(all(not item["value"]["source_node"].startswith("<") for item in edges))
+
+        applied = self.client.post(
+            f"/api/modeling/projects/{project['id']}/ai/proposals/{proposal.data['id']}/apply/",
+            {},
+            format="json",
+        )
+        self.assertEqual(applied.status_code, 200)
+        self.assertEqual(UmlElement.objects.filter(project_id=project["id"], metaclass="Class").count(), 3)
+        self.assertEqual(UmlRelationship.objects.filter(project_id=project["id"], relationship_type="Association").count(), 3)
+        self.assertEqual(DiagramNode.objects.filter(diagram_id=diagram.data["id"]).count(), 3)
+        self.assertEqual(DiagramEdge.objects.filter(diagram_id=diagram.data["id"]).count(), 3)
+
+    @override_settings(AI_BASE_URL="http://provider.test")
+    @patch("modeling.ai.urllib.request.urlopen")
+    def test_ai_keeps_an_explicit_rectangle_and_diamond_as_visual_shapes(self, mocked_urlopen):
+        project = self.create_project()
+        diagram = self.client.post(
+            f"/api/modeling/projects/{project['id']}/diagrams/",
+            {"name": "Lienzo", "diagram_type": "class"},
+            format="json",
+        )
+
+        class ProviderResponse:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def read(self):
+                return json.dumps({
+                    "operations": [
+                        {"id": "dog", "entity_type": "UmlElement", "action": "create", "value": {"metaclass": "Class", "name": "Perro"}},
+                        {"id": "cat", "entity_type": "UmlElement", "action": "create", "value": {"metaclass": "Class", "name": "Gato"}},
+                        {"id": "association", "entity_type": "UmlRelationship", "action": "create", "depends_on": ["dog", "cat"], "value": {"relationship_type": "Association", "source": "dog", "target": "cat"}},
+                    ],
+                    "warnings": [], "questions": [], "assumptions": [], "diagnostics": [],
+                }).encode()
+
+        mocked_urlopen.return_value = ProviderResponse()
+        proposal = self.client.post(
+            f"/api/modeling/projects/{project['id']}/ai/proposals/",
+            {"prompt": "Añade un cuadrado y un rombo, relaciónalos y ponles nombres de animales", "diagram_id": diagram.data["id"]},
+            format="json",
+        )
+        self.assertEqual(proposal.status_code, 201)
+        operations = proposal.data["proposal"]["operations"]
+        self.assertEqual([item["entity_type"] for item in operations], ["DiagramNode", "DiagramNode", "DiagramEdge"])
+        self.assertEqual([item["value"]["properties"]["shape"] for item in operations[:2]], ["rectangle", "diamond"])
+        self.assertEqual([item["value"]["properties"]["label"] for item in operations[:2]], ["Perro", "Gato"])
+        self.assertTrue(all(item["value"].get("element") is None for item in operations[:2]))
+        self.assertIsNone(operations[2]["value"]["relationship"])
+
+        applied = self.client.post(
+            f"/api/modeling/projects/{project['id']}/ai/proposals/{proposal.data['id']}/apply/",
+            {},
+            format="json",
+        )
+        self.assertEqual(applied.status_code, 200)
+        self.assertEqual(UmlElement.objects.filter(project_id=project["id"]).count(), 0)
+        self.assertEqual(UmlRelationship.objects.filter(project_id=project["id"]).count(), 0)
+        self.assertEqual(DiagramNode.objects.filter(diagram_id=diagram.data["id"], properties__kind="visual").count(), 2)
+        self.assertEqual(DiagramEdge.objects.filter(diagram_id=diagram.data["id"], properties__kind="visual").count(), 1)
+
+    @override_settings(AI_BASE_URL="http://provider.test")
+    @patch("modeling.ai.urllib.request.urlopen")
+    def test_ai_replaces_named_uml_views_with_visual_shapes_without_deleting_semantics(self, mocked_urlopen):
+        project_data = self.create_project()
+        project = Project.objects.get(pk=project_data["id"])
+        diagram = Diagram.objects.create(
+            project=project,
+            name="Lienzo",
+            diagram_type="class",
+            created_by=self.owner,
+        )
+        dog = UmlElement.objects.create(
+            project=project, metaclass="Interface", name="perro", created_by=self.owner,
+        )
+        cat = UmlElement.objects.create(
+            project=project, metaclass="Class", name="gato", created_by=self.owner,
+        )
+        dog_node = DiagramNode.objects.create(
+            diagram=diagram, element=dog, x=-162.79, y=-13.45, width=150, height=80,
+        )
+        cat_node = DiagramNode.objects.create(
+            diagram=diagram, element=cat, x=142.88, y=-177.57, width=150, height=80,
+        )
+        relationship = UmlRelationship.objects.create(
+            project=project,
+            relationship_type="Association",
+            source=cat,
+            target=dog,
+        )
+        DiagramEdge.objects.create(
+            diagram=diagram,
+            relationship=relationship,
+            source_node=cat_node,
+            target_node=dog_node,
+        )
+
+        class ProviderResponse:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def read(self):
+                return json.dumps({
+                    "operations": [
+                        {
+                            "id": "diamond",
+                            "entity_type": "DiagramNode",
+                            "action": "create",
+                            "value": {
+                                "diagram": str(diagram.id), "element": None,
+                                "x": 140, "y": 160, "width": 150, "height": 110,
+                                "properties": {"kind": "visual", "library": "general", "shape": "diamond", "label": "Rombo", "style": {}},
+                            },
+                        },
+                        {
+                            "id": "rectangle",
+                            "entity_type": "DiagramNode",
+                            "action": "create",
+                            "value": {
+                                "diagram": str(diagram.id), "element": None,
+                                "x": 440, "y": 160, "width": 180, "height": 110,
+                                "properties": {"kind": "visual", "library": "general", "shape": "rectangle", "label": "Cuadrado", "style": {}},
+                            },
+                        },
+                    ],
+                    "questions": [
+                        "Se eliminarán los elementos UML subyacentes y se crearán figuras visuales. ¿Es este comportamiento deseado?"
+                    ],
+                    "warnings": [], "assumptions": [], "diagnostics": [],
+                }).encode()
+
+        mocked_urlopen.return_value = ProviderResponse()
+        proposal = self.client.post(
+            f"/api/modeling/projects/{project.id}/ai/proposals/",
+            {
+                "prompt": "puedes reemplazar las clases que estan como perro y gato por las figura rombo y cuadrado",
+                "diagram_id": str(diagram.id),
+            },
+            format="json",
+        )
+
+        self.assertEqual(proposal.status_code, 201)
+        normalized = proposal.data["proposal"]
+        self.assertEqual(normalized["questions"], [])
+        created_nodes = [
+            item for item in normalized["operations"]
+            if item["entity_type"] == "DiagramNode" and item["action"] == "create"
+        ]
+        created_edge = next(
+            item for item in normalized["operations"]
+            if item["entity_type"] == "DiagramEdge" and item["action"] == "create"
+        )
+        deleted_nodes = [
+            item for item in normalized["operations"]
+            if item["entity_type"] == "DiagramNode" and item["action"] == "delete"
+        ]
+        self.assertEqual(
+            [(item["value"]["properties"]["label"], item["value"]["properties"]["shape"]) for item in created_nodes],
+            [("perro", "diamond"), ("gato", "rectangle")],
+        )
+        self.assertEqual(
+            [(item["value"]["x"], item["value"]["y"]) for item in created_nodes],
+            [(dog_node.x, dog_node.y), (cat_node.x, cat_node.y)],
+        )
+        self.assertIsNone(created_edge["value"]["relationship"])
+        self.assertEqual({item["entity_id"] for item in deleted_nodes}, {str(dog_node.id), str(cat_node.id)})
+
+        applied = self.client.post(
+            f"/api/modeling/projects/{project.id}/ai/proposals/{proposal.data['id']}/apply/",
+            {"operation_ids": [item["id"] for item in normalized["operations"]]},
+            format="json",
+        )
+        self.assertEqual(applied.status_code, 200)
+        self.assertTrue(UmlElement.objects.filter(pk=dog.id).exists())
+        self.assertTrue(UmlElement.objects.filter(pk=cat.id).exists())
+        self.assertTrue(UmlRelationship.objects.filter(pk=relationship.id).exists())
+        self.assertFalse(DiagramNode.objects.filter(pk=dog_node.id).exists())
+        self.assertFalse(DiagramNode.objects.filter(pk=cat_node.id).exists())
+        self.assertEqual(DiagramNode.objects.filter(diagram=diagram, properties__kind="visual").count(), 2)
+        self.assertEqual(DiagramEdge.objects.filter(diagram=diagram, properties__kind="visual").count(), 1)
+
+    @override_settings(AI_BASE_URL="http://provider.test")
+    @patch("modeling.ai.urllib.request.urlopen")
+    def test_ai_connects_actor_to_package_figure_without_blocking_question(self, mocked_urlopen):
+        project_data = self.create_project()
+        project = Project.objects.get(pk=project_data["id"])
+        diagram = Diagram.objects.create(
+            project=project,
+            name="Clases",
+            diagram_type="class",
+            created_by=self.owner,
+        )
+        actor_id = "a1b2c3d4-e5f6-4789-abcd-ef0123456789"
+        package_id = "b2c3d4e5-f6a7-4890-bcde-f01234567890"
+        relationship_id = "c3d4e5f6-a7b8-4901-cdef-012345678901"
+        actor_node_id = "d4e5f6a7-b8c9-4012-defa-123456789012"
+        package_node_id = "e5f6a7b8-c9d0-4123-efab-234567890123"
+
+        class ProviderResponse:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def read(self):
+                return json.dumps({
+                    "operations": [
+                        {
+                            "id": "create-actor", "entity_type": "UmlElement", "entity_id": actor_id,
+                            "action": "create", "value": {
+                                "metaclass": "Actor", "name": "cliente", "package_id": None, "properties": {},
+                            },
+                        },
+                        {
+                            "id": "create-package", "entity_type": "UmlPackage", "entity_id": package_id,
+                            "action": "create", "value": {"name": "cajas", "parent_id": None, "properties": {}},
+                        },
+                        {
+                            "id": "create-relation", "entity_type": "UmlRelationship", "entity_id": relationship_id,
+                            "action": "create", "value": {
+                                "relationship_type": "Association", "source_id": actor_id,
+                                "target_id": package_id, "properties": {},
+                            },
+                        },
+                        {
+                            "id": "create-actor-node", "entity_type": "DiagramNode", "entity_id": actor_node_id,
+                            "action": "create", "value": {
+                                "diagram": str(diagram.id), "element": actor_id, "x": -500, "y": 400,
+                                "width": 100, "height": 100, "properties": {},
+                            },
+                        },
+                        {
+                            "id": "create-package-node", "entity_type": "DiagramNode", "entity_id": package_node_id,
+                            "action": "create", "value": {
+                                "element": package_id, "x": -300, "y": 400,
+                                "width": 150, "height": 100, "properties": {},
+                            },
+                        },
+                        {
+                            "id": "create-edge", "entity_type": "DiagramEdge", "action": "create",
+                            "value": {
+                                "diagram": str(diagram.id), "relationship": relationship_id,
+                                "source_node": actor_node_id, "target_node": package_node_id, "properties": {},
+                            },
+                        },
+                    ],
+                    "questions": [
+                        "¿Qué tipo de relación deseas entre 'cliente' y el paquete 'cajas'? He asumido una Asociación simple."
+                    ],
+                    "assumptions": ["Se establece una relación de tipo Association."],
+                    "warnings": [], "diagnostics": [],
+                }).encode()
+
+        mocked_urlopen.return_value = ProviderResponse()
+        proposal = self.client.post(
+            f"/api/modeling/projects/{project.id}/ai/proposals/",
+            {
+                "prompt": "añade un actor llamado cliente y relacionalo con un paquete llamado cajas",
+                "diagram_id": str(diagram.id),
+            },
+            format="json",
+        )
+
+        self.assertEqual(proposal.status_code, 201)
+        normalized = proposal.data["proposal"]
+        self.assertEqual(normalized["questions"], [])
+        self.assertFalse(any(item["entity_type"] == "UmlPackage" for item in normalized["operations"]))
+        elements = [item for item in normalized["operations"] if item["entity_type"] == "UmlElement"]
+        self.assertEqual(
+            {(item["value"]["name"], item["value"]["metaclass"]) for item in elements},
+            {("cliente", "Actor"), ("cajas", "Package")},
+        )
+        package_node = next(
+            item for item in normalized["operations"]
+            if item["entity_type"] == "DiagramNode" and item["value"]["element"] == package_id
+        )
+        self.assertEqual(package_node["value"]["diagram"], str(diagram.id))
+
+        applied = self.client.post(
+            f"/api/modeling/projects/{project.id}/ai/proposals/{proposal.data['id']}/apply/",
+            {"operation_ids": [item["id"] for item in normalized["operations"]]},
+            format="json",
+        )
+        self.assertEqual(applied.status_code, 200)
+        self.assertFalse(UmlPackage.objects.filter(project=project, name="cajas").exists())
+        actor = UmlElement.objects.get(project=project, name="cliente")
+        package = UmlElement.objects.get(project=project, name="cajas")
+        self.assertEqual(actor.metaclass, "Actor")
+        self.assertEqual(package.metaclass, "Package")
+        relationship = UmlRelationship.objects.get(project=project, source=actor, target=package)
+        self.assertEqual(relationship.relationship_type, "Association")
+        self.assertEqual(DiagramNode.objects.filter(diagram=diagram, element__in=[actor, package]).count(), 2)
+        self.assertTrue(DiagramEdge.objects.filter(diagram=diagram, relationship=relationship).exists())
+
+    @override_settings(AI_BASE_URL="http://provider.test")
+    @patch("modeling.ai.urllib.request.urlopen")
+    def test_ai_completes_incomplete_explicit_many_to_many_canvas_graph(self, mocked_urlopen):
+        project = self.create_project()
+        diagram = self.client.post(
+            f"/api/modeling/projects/{project['id']}/diagrams/",
+            {"name": "Clases", "diagram_type": "class"},
+            format="json",
+        )
+        nested_persona_id = str(uuid.uuid4())
+        nested_mascota_id = str(uuid.uuid4())
+
+        class ProviderResponse:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def read(self):
+                return json.dumps({
+                    "operations": [
+                        {"id": "persona", "entity_type": "UmlElement", "action": "create", "value": {"entity_id": nested_persona_id, "metaclass": "Class", "name": "Persona", "properties": {"attributes": ["+ nombre: String", "+ edad: Integer", "+ sexo: String"]}}},
+                        {"id": "mascota", "entity_type": "UmlElement", "action": "create", "value": {"entity_id": nested_mascota_id, "metaclass": "Class", "name": "Mascota", "properties": {"attributes": ["+ nombre: String", "+ edad: Integer", "+ sexo: String"]}}},
+                        {"id": "relation", "entity_type": "UmlRelationship", "action": "create", "value": {"relationship_type": "Association", "source": str(uuid.uuid4()), "target": None, "properties": {}}},
+                        {"id": "node-persona", "entity_type": "DiagramNode", "action": "create", "value": {"diagram": diagram.data["id"], "element": None}},
+                        {"id": "node-mascota", "entity_type": "DiagramNode", "action": "create", "depends_on": ["mascota"], "value": {"diagram": diagram.data["id"], "element": "mascota"}},
+                    ],
+                    "questions": [
+                        "¿Cuál será el ID de Mascota para establecer la relación?",
+                        "¿Desea agregar las clases al diagrama actual?",
+                    ],
+                    "warnings": [],
+                }).encode()
+
+        mocked_urlopen.return_value = ProviderResponse()
+        proposal = self.client.post(
+            f"/api/modeling/projects/{project['id']}/ai/proposals/",
+            {
+                "prompt": "Crea Persona y Mascota con nombre, edad y sexo y relaciónalas de muchos a muchos",
+                "diagram_id": diagram.data["id"],
+            },
+            format="json",
+        )
+
+        self.assertEqual(proposal.status_code, 201)
+        self.assertEqual(proposal.data["proposal"]["questions"], [])
+        self.assertEqual(len(proposal.data["proposal"]["operations"]), 6)
+        self.assertEqual(proposal.data["proposal"]["operations"][0]["entity_id"], nested_persona_id)
+        self.assertNotIn("entity_id", proposal.data["proposal"]["operations"][0]["value"])
+        applied = self.client.post(
+            f"/api/modeling/projects/{project['id']}/ai/proposals/{proposal.data['id']}/apply/",
+            {},
+            format="json",
+        )
+        self.assertEqual(applied.status_code, 200)
+        relationship = UmlRelationship.objects.get(project_id=project["id"])
+        self.assertEqual({relationship.source.name, relationship.target.name}, {"Persona", "Mascota"})
+        self.assertEqual(relationship.properties["multiplicity"], {"source": "*", "target": "*"})
+        self.assertTrue(DiagramEdge.objects.filter(diagram_id=diagram.data["id"], relationship=relationship).exists())
+
+    @override_settings(AI_BASE_URL="http://provider.test")
+    @patch("modeling.ai.urllib.request.urlopen")
+    def test_ai_rejects_unsafe_or_ambiguous_scalar_updates(self, mocked_urlopen):
+        project = self.create_project()
+
+        class ProviderResponse:
+            def __init__(self, payload): self.payload = payload
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def read(self): return json.dumps(self.payload).encode()
+
+        base = {"entity_type": "UmlElement", "action": "update", "entity_id": str(uuid.uuid4()), "value": "x"}
+        for path in ("", "id", "name.first"):
+            operation = {**base, "path": path}
+            mocked_urlopen.return_value = ProviderResponse({"operations": [operation], "warnings": []})
+            response = self.client.post(
+                f"/api/modeling/projects/{project['id']}/ai/proposals/",
+                {"prompt": "actualiza"},
+                format="json",
+            )
+            self.assertEqual(response.status_code, 503)
+        self.assertFalse(project["id"] in [str(item.project_id) for item in UmlElement.objects.all()])
+
+    @override_settings(
+        AI_PROVIDER="xkiro",
+        AI_BASE_URL="https://api.xkiro.test/v1",
+        AI_API_KEY="xkiro-secret",
+        AI_MODEL="minimax/minimax-m3:free",
+    )
+    @patch("modeling.ai.urllib.request.urlopen")
+    def test_ai_uses_openai_tool_call_without_exposing_key(self, mocked_urlopen):
+        arguments = {
+            "operations": [
+                {
+                    "id": "create-customer",
+                    "entity_type": "UmlElement",
+                    "action": "create",
+                    "value": {"metaclass": "Class", "name": "Cliente"},
+                    "depends_on": [],
+                    "explanation": "Representa al cliente del dominio.",
+                }
+            ],
+            "questions": [],
+            "assumptions": [],
+            "warnings": [],
+            "diagnostics": [],
+        }
+
+        class ProviderResponse:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def read(self):
+                return json.dumps({
+                    "choices": [{
+                        "message": {
+                            "content": None,
+                            "tool_calls": [{
+                                "function": {
+                                    "name": "submit_uml_proposal",
+                                    "arguments": json.dumps(arguments),
+                                }
+                            }],
+                        }
+                    }]
+                }).encode()
+
+        mocked_urlopen.return_value = ProviderResponse()
+        project = self.create_project()
+        diagram = self.client.post(
+            f"/api/modeling/projects/{project['id']}/diagrams/",
+            {"name": "Clases", "diagram_type": "class"},
+            format="json",
+        )
+        response = self.client.post(
+            f"/api/modeling/projects/{project['id']}/ai/proposals/",
+            {"prompt": "Agrega Cliente", "diagram_id": diagram.data["id"]},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["provider"], "xkiro")
+        self.assertEqual(response.data["model"], "minimax/minimax-m3:free")
+        self.assertEqual(response.data["proposal"]["operations"][0]["value"]["name"], "Cliente")
+        sent_request = mocked_urlopen.call_args.args[0]
+        sent_payload = json.loads(sent_request.data.decode())
+        self.assertEqual(sent_request.full_url, "https://api.xkiro.test/v1/chat/completions")
+        self.assertEqual(sent_request.headers["Authorization"], "Bearer xkiro-secret")
+        self.assertEqual(sent_request.headers["Accept"], "application/json")
+        self.assertEqual(sent_request.headers["User-agent"], "sw1-uml-modeler/1.0")
+        self.assertEqual(sent_payload["tool_choice"]["function"]["name"], "submit_uml_proposal")
+        self.assertIn('"diagram"', sent_payload["messages"][1]["content"])
+        self.assertNotIn("xkiro-secret", json.dumps(sent_payload))
+
+    @override_settings(AI_BASE_URL="http://provider.test")
+    @patch("modeling.ai.urllib.request.urlopen")
+    def test_ai_retries_empty_tool_response_once_in_json_mode(self, mocked_urlopen):
+        class ProviderResponse:
+            def __init__(self, payload): self.payload = payload
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def read(self): return json.dumps(self.payload).encode()
+
+        mocked_urlopen.side_effect = [
+            ProviderResponse({
+                "choices": [{"message": {"role": "assistant", "content": ""}, "finish_reason": "stop"}],
+                "usage": {"completion_tokens": 0},
+            }),
+            ProviderResponse({
+                "choices": [{
+                    "message": {"role": "assistant", "content": json.dumps({
+                        "operations": [{
+                            "id": "create-person",
+                            "entity_type": "UmlElement",
+                            "action": "create",
+                            "value": {"metaclass": "Class", "name": "Persona"},
+                        }],
+                        "questions": [],
+                        "assumptions": [],
+                        "warnings": [],
+                        "diagnostics": [],
+                    })},
+                    "finish_reason": "stop",
+                }],
+            }),
+        ]
+        project = self.create_project()
+        response = self.client.post(
+            f"/api/modeling/projects/{project['id']}/ai/proposals/",
+            {"prompt": "Crea Persona"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(mocked_urlopen.call_count, 2)
+        fallback = json.loads(mocked_urlopen.call_args_list[1].args[0].data.decode())
+        self.assertEqual(fallback["response_format"], {"type": "json_object"})
+        self.assertNotIn("tools", fallback)
+
+    @override_settings(AI_BASE_URL="http://provider.test")
+    @patch("modeling.ai.urllib.request.urlopen")
+    def test_ai_retries_a_closed_tool_connection_in_json_mode(self, mocked_urlopen):
+        class ProviderResponse:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def read(self):
+                return json.dumps({
+                    "choices": [{
+                        "message": {"role": "assistant", "content": json.dumps({
+                            "operations": [{
+                                "id": "create-person",
+                                "entity_type": "UmlElement",
+                                "action": "create",
+                                "value": {"metaclass": "Class", "name": "Persona"},
+                            }],
+                            "questions": [],
+                            "assumptions": [],
+                            "warnings": [],
+                            "diagnostics": [],
+                        })},
+                        "finish_reason": "stop",
+                    }],
+                }).encode()
+
+        mocked_urlopen.side_effect = [
+            http.client.RemoteDisconnected("Remote end closed connection without response"),
+            ProviderResponse(),
+        ]
+        project = self.create_project()
+        response = self.client.post(
+            f"/api/modeling/projects/{project['id']}/ai/proposals/",
+            {"prompt": "Crea Persona"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(mocked_urlopen.call_count, 2)
+        fallback = json.loads(mocked_urlopen.call_args_list[1].args[0].data.decode())
+        self.assertNotIn("tools", fallback)
+        self.assertEqual(response.data["proposal"]["operations"][0]["value"]["name"], "Persona")
+
+    @override_settings(AI_BASE_URL="http://provider.test")
+    @patch("modeling.ai.urllib.request.urlopen", side_effect=http.client.RemoteDisconnected("closed"))
+    def test_ai_closed_connections_return_recoverable_error_without_mutation(self, mocked_urlopen):
+        project = self.create_project()
+        response = self.client.post(
+            f"/api/modeling/projects/{project['id']}/ai/proposals/",
+            {"prompt": "Crea Persona y Mascota"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("ambos intentos", response.data["detail"])
+        self.assertEqual(mocked_urlopen.call_count, 2)
+        self.assertEqual(Project.objects.get(pk=project["id"]).revision, 0)
+
+    @override_settings(AI_BASE_URL="http://provider.test", AI_MAX_PROMPT_CHARS=10)
+    def test_ai_rejects_oversized_prompt_before_calling_provider(self):
+        project = self.create_project()
+        response = self.client.post(
+            f"/api/modeling/projects/{project['id']}/ai/proposals/",
+            {"prompt": "x" * 11},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(Project.objects.get(pk=project["id"]).revision, 0)
+
+    @override_settings(AI_BASE_URL="http://provider.test")
+    @patch("modeling.ai.urllib.request.urlopen")
+    def test_ai_context_includes_canvas_ids_and_limits_an_explicit_selection(self, mocked_urlopen):
+        class ProviderResponse:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def read(self):
+                return json.dumps({
+                    "operations": [],
+                    "questions": [],
+                    "assumptions": [],
+                    "warnings": [],
+                    "diagnostics": [],
+                }).encode()
+
+        mocked_urlopen.return_value = ProviderResponse()
+        project = self.create_project()
+        diagram = self.client.post(
+            f"/api/modeling/projects/{project['id']}/diagrams/",
+            {"name": "Clases", "diagram_type": "class"},
+            format="json",
+        )
+        selected = self.client.post(
+            f"/api/modeling/projects/{project['id']}/elements/",
+            {"name": "Seleccionada", "metaclass": "Class"},
+            format="json",
+        )
+        other = self.client.post(
+            f"/api/modeling/projects/{project['id']}/elements/",
+            {"name": "Fuera", "metaclass": "Class"},
+            format="json",
+        )
+        node = self.client.post(
+            f"/api/modeling/projects/{project['id']}/diagrams/{diagram.data['id']}/nodes/",
+            {"element": selected.data["id"], "x": 10, "y": 20, "width": 180, "height": 90},
+            format="json",
+        )
+
+        response = self.client.post(
+            f"/api/modeling/projects/{project['id']}/ai/proposals/",
+            {
+                "prompt": "Edita la clase seleccionada",
+                "diagram_id": diagram.data["id"],
+                "selection": [selected.data["id"]],
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        sent_payload = json.loads(mocked_urlopen.call_args.args[0].data.decode())
+        context = json.loads(sent_payload["messages"][1]["content"].split("Contexto autorizado del proyecto (JSON):\n", 1)[1])
+        self.assertEqual([item["id"] for item in context["elements"]], [selected.data["id"]])
+        self.assertNotIn(other.data["id"], json.dumps(context))
+        self.assertEqual(context["diagram"]["nodes"][0]["id"], node.data["id"])
 
     @override_settings(AI_BASE_URL="http://provider.test")
     @patch("modeling.ai.urllib.request.urlopen")
@@ -659,6 +1863,111 @@ class ModelingApiTests(TestCase):
         self.assertEqual(applied.status_code, 200)
         self.assertEqual(UmlElement.objects.filter(project=project["id"]).count(), 1)
         self.assertTrue(UmlElement.objects.filter(project=project["id"], name="Uno").exists())
+
+    @override_settings(AI_BASE_URL="http://provider.test", AI_MODEL="uml-test-model")
+    @patch("modeling.ai.urllib.request.urlopen")
+    def test_ai_can_create_semantic_element_and_its_diagram_node(self, mocked_urlopen):
+        element_id = str(uuid.uuid4())
+        node_id = str(uuid.uuid4())
+
+        class ProviderResponse:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def read(self):
+                return json.dumps({
+                    "operations": [
+                        {
+                            "id": "create-element",
+                            "entity_type": "UmlElement",
+                            "entity_id": element_id,
+                            "action": "create",
+                            "value": {"id": element_id, "metaclass": "Class", "name": "Factura"},
+                        },
+                        {
+                            "id": "create-node",
+                            "entity_type": "DiagramNode",
+                            "entity_id": node_id,
+                            "action": "create",
+                            "depends_on": ["create-element"],
+                            "value": {
+                                "id": node_id,
+                                "diagram": diagram_id,
+                                "element": element_id,
+                                "x": 220,
+                                "y": 140,
+                                "width": 180,
+                                "height": 96,
+                                "properties": {},
+                            },
+                        },
+                    ],
+                    "assumptions": ["Se usa el diagrama de clases actual."],
+                    "warnings": [],
+                }).encode()
+
+        project = self.create_project()
+        diagram = self.client.post(
+            f"/api/modeling/projects/{project['id']}/diagrams/",
+            {"name": "Clases", "diagram_type": "class"},
+            format="json",
+        )
+        diagram_id = diagram.data["id"]
+        mocked_urlopen.return_value = ProviderResponse()
+
+        proposal = self.client.post(
+            f"/api/modeling/projects/{project['id']}/ai/proposals/",
+            {"prompt": "Añade Factura al diagrama"},
+            format="json",
+        )
+        self.assertEqual(proposal.status_code, 201)
+        self.assertEqual(proposal.data["model"], "uml-test-model")
+        rejected = self.client.post(
+            f"/api/modeling/projects/{project['id']}/ai/proposals/{proposal.data['id']}/apply/",
+            {"operation_ids": ["create-node"]},
+            format="json",
+        )
+        self.assertEqual(rejected.status_code, 400)
+        self.assertFalse(UmlElement.objects.filter(pk=element_id).exists())
+
+        applied = self.client.post(
+            f"/api/modeling/projects/{project['id']}/ai/proposals/{proposal.data['id']}/apply/",
+            {"operation_ids": ["create-element", "create-node"]},
+            format="json",
+        )
+        self.assertEqual(applied.status_code, 200)
+        self.assertTrue(UmlElement.objects.filter(pk=element_id, name="Factura").exists())
+        self.assertTrue(DiagramNode.objects.filter(pk=node_id, element_id=element_id).exists())
+        self.assertEqual([item["origin"] for item in applied.data["operations"]], ["ai", "ai"])
+
+    @override_settings(AI_BASE_URL="http://provider.test")
+    @patch("modeling.ai.urllib.request.urlopen")
+    def test_ai_questions_block_confirmation_until_a_new_proposal(self, mocked_urlopen):
+        class ProviderResponse:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def read(self):
+                return json.dumps({
+                    "operations": [],
+                    "questions": ["¿Qué multiplicidad debe tener la relación?"],
+                    "warnings": [],
+                }).encode()
+
+        mocked_urlopen.return_value = ProviderResponse()
+        project = self.create_project()
+        proposal = self.client.post(
+            f"/api/modeling/projects/{project['id']}/ai/proposals/",
+            {"prompt": "Relaciona las clases"},
+            format="json",
+        )
+        self.assertEqual(proposal.status_code, 201)
+        self.assertEqual(len(proposal.data["proposal"]["questions"]), 1)
+        applied = self.client.post(
+            f"/api/modeling/projects/{project['id']}/ai/proposals/{proposal.data['id']}/apply/",
+            {},
+            format="json",
+        )
+        self.assertEqual(applied.status_code, 400)
+        self.assertEqual(Project.objects.get(pk=project["id"]).revision, 0)
 
 
 class ModelingWebsocketTests(TransactionTestCase):

@@ -1,0 +1,39 @@
+[
+  {
+    "name": "modelo_valido_minimo",
+    "context": {
+      "project": {"mda_level": "PIM"},
+      "permission": "editor",
+      "elements": [
+        {"id": "e1", "metaclass": "Class", "name": "Pedido", "properties": {"attributes": ["id: UUID", "total: Decimal"]}}
+      ],
+      "relationships": [],
+      "operations": []
+    },
+    "must_not_contain": ["class.attributes.typed", "proposal.permission.write", "spring.entity.identifier"]
+  },
+  {
+    "name": "atributo_sin_tipo",
+    "context": {
+      "project": {"mda_level": "PIM"},
+      "permission": "editor",
+      "elements": [
+        {"id": "e1", "metaclass": "Class", "name": "Pedido", "properties": {"attributes": ["id: UUID", "total"]}}
+      ],
+      "relationships": [],
+      "operations": []
+    },
+    "must_contain": ["class.attributes.typed"]
+  },
+  {
+    "name": "lector_no_confirma",
+    "context": {
+      "project": {"mda_level": "PIM"},
+      "permission": "viewer",
+      "elements": [],
+      "relationships": [],
+      "operations": [{"id": "o1"}]
+    },
+    "must_contain": ["proposal.permission.write"]
+  }
+]

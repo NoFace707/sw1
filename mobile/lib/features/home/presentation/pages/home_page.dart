@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import '../../../../core/auth/auth_session_manager.dart';
@@ -7,6 +9,8 @@ import '../../../auth/presentation/pages/login_page.dart';
 import '../../../viewer/data/viewer_repository.dart';
 import '../../../viewer/domain/viewer_models.dart';
 import '../../../viewer/presentation/pages/uml_viewer_page.dart';
+import '../../../offline/data/connectivity_service.dart';
+import '../../../ai/presentation/local_ai_model_sheet.dart';
 
 class HomePage extends StatefulWidget {
   const HomePage({
@@ -28,30 +32,120 @@ class _HomePageState extends State<HomePage> {
   late final ViewerRepository _repository =
       widget.viewerRepository ??
       MobileViewerRepository(userId: '${widget.user.id}');
+  OfflineCapableViewerRepository? get _offlineRepository =>
+      _repository is OfflineCapableViewerRepository
+      ? _repository as OfflineCapableViewerRepository
+      : null;
   final _searchController = TextEditingController();
   List<UmlProjectSummary> _projects = const [];
   bool _loading = true;
+  final Set<String> _offlineBusy = {};
+  MobileConnectivityState _connectivity = MobileConnectivityState.online;
+  StreamSubscription<MobileConnectivityState>? _connectivitySubscription;
+  bool _connectivityReady = false;
   String? _error;
 
   @override
   void initState() {
     super.initState();
-    _loadProjects();
+    final offlineRepository = _offlineRepository;
+    if (offlineRepository == null) {
+      _loadProjects();
+      return;
+    }
+    _connectivitySubscription = offlineRepository.watchConnectivity().listen(
+      (state) {
+        if (!mounted) return;
+        final firstState = !_connectivityReady;
+        setState(() {
+          _connectivity = state;
+          _connectivityReady = true;
+        });
+        if (firstState) {
+          _loadProjects(refresh: state == MobileConnectivityState.online);
+        } else if (state == MobileConnectivityState.online) {
+          _loadProjects();
+        }
+      },
+      onError: (_) {
+        if (!mounted) return;
+        setState(() {
+          _connectivity = MobileConnectivityState.offline;
+          _connectivityReady = true;
+        });
+        _loadProjects(refresh: false);
+      },
+    );
   }
 
   @override
   void dispose() {
     _searchController.dispose();
+    _connectivitySubscription?.cancel();
+    _offlineRepository?.close();
     super.dispose();
   }
 
-  Future<void> _loadProjects() async {
+  Future<void> _toggleOffline(UmlProjectSummary project) async {
+    if (_offlineBusy.contains(project.id)) return;
+    final offlineRepository = _offlineRepository;
+    if (offlineRepository == null) return;
+    setState(() {
+      _offlineBusy.add(project.id);
+      _replaceProject(project.copyWith(syncState: ViewerSyncState.syncing));
+    });
+    try {
+      final updated = await offlineRepository.setOfflineAvailability(
+        project,
+        !project.availableOffline,
+      );
+      if (!mounted) return;
+      setState(() {
+        _replaceProject(updated);
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            updated.availableOffline
+                ? '${updated.name} ya está disponible sin conexión.'
+                : 'Se eliminó la copia offline de ${updated.name}.',
+          ),
+        ),
+      );
+    } on ViewerRepositoryException catch (error) {
+      if (mounted) {
+        setState(() => _replaceProject(project));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(error.message)));
+      }
+    } catch (_) {
+      if (mounted) {
+        setState(() => _replaceProject(project));
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('No se pudo preparar la copia offline.'),
+          ),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _offlineBusy.remove(project.id));
+    }
+  }
+
+  void _replaceProject(UmlProjectSummary project) {
+    _projects = _projects
+        .map((item) => item.id == project.id ? project : item)
+        .toList(growable: false);
+  }
+
+  Future<void> _loadProjects({bool refresh = true}) async {
     setState(() {
       _loading = true;
       _error = null;
     });
     try {
-      final projects = await _repository.loadProjects();
+      final projects = await _repository.loadProjects(refresh: refresh);
       if (mounted) setState(() => _projects = projects);
     } on ViewerRepositoryException catch (error) {
       if (mounted) setState(() => _error = error.message);
@@ -74,6 +168,13 @@ class _HomePageState extends State<HomePage> {
       (_) => false,
     );
   }
+
+  Future<void> _manageLocalAi() => showModalBottomSheet<void>(
+    context: context,
+    showDragHandle: true,
+    isScrollControlled: true,
+    builder: (_) => LocalAiModelSheet(userId: '${widget.user.id}'),
+  );
 
   void _open(UmlProjectSummary project) {
     Navigator.of(context).push(
@@ -103,8 +204,30 @@ class _HomePageState extends State<HomePage> {
     return Scaffold(
       key: const ValueKey('home-page'),
       appBar: AppBar(
-        title: const Text('Proyectos UML'),
+        title: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text('Proyectos UML'),
+            const SizedBox(width: 8),
+            Icon(
+              _connectivity == MobileConnectivityState.online
+                  ? Icons.cloud_done_outlined
+                  : Icons.cloud_off_outlined,
+              key: ValueKey('connectivity-${_connectivity.name}'),
+              size: 18,
+              color: _connectivity == MobileConnectivityState.online
+                  ? Colors.green
+                  : Colors.blueGrey,
+            ),
+          ],
+        ),
         actions: [
+          IconButton(
+            key: const ValueKey('local-ai-model'),
+            tooltip: 'Modelo de IA local',
+            onPressed: _manageLocalAi,
+            icon: const Icon(Icons.memory_outlined),
+          ),
           IconButton(
             key: const ValueKey('refresh-projects'),
             tooltip: 'Actualizar proyectos',
@@ -162,7 +285,10 @@ class _HomePageState extends State<HomePage> {
             ),
             if (_loading)
               const SliverFillRemaining(
-                child: Center(child: CircularProgressIndicator()),
+                child: _HomeMessage(
+                  icon: Icons.sync,
+                  message: 'Cargando proyectos…',
+                ),
               )
             else if (_error != null)
               SliverFillRemaining(
@@ -192,6 +318,10 @@ class _HomePageState extends State<HomePage> {
                     return _ProjectCard(
                       project: project,
                       onOpen: () => _open(project),
+                      offlineBusy: _offlineBusy.contains(project.id),
+                      canDownload:
+                          _connectivity == MobileConnectivityState.online,
+                      onToggleOffline: () => _toggleOffline(project),
                     );
                   },
                 ),
@@ -204,15 +334,25 @@ class _HomePageState extends State<HomePage> {
 }
 
 class _ProjectCard extends StatelessWidget {
-  const _ProjectCard({required this.project, required this.onOpen});
+  const _ProjectCard({
+    required this.project,
+    required this.onOpen,
+    required this.onToggleOffline,
+    required this.offlineBusy,
+    required this.canDownload,
+  });
   final UmlProjectSummary project;
   final VoidCallback onOpen;
+  final VoidCallback onToggleOffline;
+  final bool offlineBusy;
+  final bool canDownload;
 
   @override
   Widget build(BuildContext context) {
     final stateLabel = switch (project.syncState) {
       ViewerSyncState.updated => 'Actualizado',
       ViewerSyncState.offline => 'Offline',
+      ViewerSyncState.syncing => 'Sincronizando',
       ViewerSyncState.pending => 'Pendiente',
       ViewerSyncState.conflict => 'Conflicto',
     };
@@ -251,7 +391,32 @@ class _ProjectCard extends StatelessWidget {
               ],
             ),
           ),
-          trailing: const Icon(Icons.chevron_right),
+          trailing: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (offlineBusy)
+                const SizedBox.square(
+                  dimension: 24,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+              else
+                IconButton(
+                  key: ValueKey('offline-${project.id}'),
+                  tooltip: project.availableOffline
+                      ? 'Eliminar copia offline'
+                      : 'Disponible sin conexión',
+                  onPressed: (project.availableOffline || canDownload)
+                      ? onToggleOffline
+                      : null,
+                  icon: Icon(
+                    project.availableOffline
+                        ? Icons.offline_pin_outlined
+                        : Icons.download_for_offline_outlined,
+                  ),
+                ),
+              const Icon(Icons.chevron_right),
+            ],
+          ),
           onTap: onOpen,
         ),
       ),

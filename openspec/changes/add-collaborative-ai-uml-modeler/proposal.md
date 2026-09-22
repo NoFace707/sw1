@@ -14,6 +14,7 @@ La pantalla de inicio autenticada necesita convertirse en la función central de
 - Incorporar edición colaborativa en tiempo real, presencia de participantes, sincronización de cambios y recuperación ante reconexiones sin sobrescribir silenciosamente el trabajo de otros.
 - Ofrecer un modo offline instalable como PWA: abrir proyectos almacenados localmente, editar, guardar una cola de cambios y sincronizar al recuperar conexión.
 - Incorporar un asistente de IA capaz de proponer diagramas o cambios desde lenguaje natural, explicar modelos, detectar inconsistencias y sugerir correcciones; el usuario deberá revisar y confirmar cualquier cambio antes de aplicarlo.
+- Incorporar dictado compartido para web y móvil mediante Whisper ejecutado localmente en el backend, sin requerir una API de transcripción externa.
 - Añadir historial/versiones recuperables del modelo para respaldar importaciones, acciones masivas de IA, sincronización y colaboración.
 - Simplificar el flujo principal con creación inmediata de un proyecto y su primer diagrama, edición inline y una paleta lateral inspirada en herramientas de diagramación general.
 - Incorporar figuras auxiliares visuales (general, flechas y entidad-relación) sin presentarlas como semántica UML ni incluirlas silenciosamente en XMI.

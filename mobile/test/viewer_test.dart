@@ -4,11 +4,39 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:mobile/features/auth/data/models/auth_user.dart';
+import 'package:mobile/features/ai/domain/mobile_ai.dart';
 import 'package:mobile/features/home/presentation/pages/home_page.dart';
 import 'package:mobile/features/viewer/data/viewer_repository.dart';
 import 'package:mobile/features/viewer/domain/viewer_models.dart';
 import 'package:mobile/features/viewer/presentation/pages/uml_viewer_page.dart';
 import 'package:mobile/features/viewer/presentation/widgets/uml_notation.dart';
+
+class _ViewerAiEngine implements MobileAiEngine {
+  @override
+  String get id => 'viewer-test';
+
+  @override
+  Future<bool> isAvailable() async => true;
+
+  @override
+  Future<MobileAiResponse> propose(
+    MobileAiRequest request, {
+    MobileAiCancellation? cancellation,
+    void Function(String token)? onToken,
+  }) async => const MobileAiResponse(
+    id: 'proposal-viewer',
+    origin: MobileAiOrigin.remote,
+    model: 'test',
+    operations: [
+      MobileAiOperation(
+        id: 'create-invoice',
+        entityType: 'UmlElement',
+        action: 'create',
+        value: {'metaclass': 'Class', 'name': 'Factura'},
+      ),
+    ],
+  );
+}
 
 const project = UmlProjectSummary(
   id: 'project-1',
@@ -457,6 +485,64 @@ void main() {
     await tester.tap(find.byKey(const ValueKey('project-project-1')));
     await tester.pumpAndSettle();
     expect(find.byKey(const ValueKey('uml-viewer-page')), findsOneWidget);
+  });
+
+  testWidgets('confirmar propuesta IA refresca el lienzo del visor', (
+    tester,
+  ) async {
+    final snapshot = fixture();
+    final updated = UmlSnapshot(
+      project: snapshot.project.copyWith(revision: 13),
+      diagrams: snapshot.diagrams,
+      elements: [
+        ...snapshot.elements,
+        const UmlElement(
+          id: 'invoice-element',
+          name: 'Factura',
+          metaclass: 'Class',
+        ),
+      ],
+      relationships: snapshot.relationships,
+      nodes: [
+        ...snapshot.nodes,
+        const UmlDiagramNode(
+          id: 'invoice-node',
+          diagramId: 'diagram-0',
+          elementId: 'invoice-element',
+          bounds: Rect.fromLTWH(330, 80, 180, 96),
+        ),
+      ],
+      edges: snapshot.edges,
+      loadedFromOffline: false,
+    );
+    await tester.pumpWidget(
+      MaterialApp(
+        home: UmlViewerPage(
+          project: project,
+          repository: FakeViewerRepository(snapshot),
+          initialSnapshot: snapshot,
+          aiEngine: _ViewerAiEngine(),
+          applyAiProposal: (proposal, selected) async {
+            expect(selected, {'create-invoice'});
+            return updated;
+          },
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('viewer-ai-assistant')));
+    await tester.pumpAndSettle();
+    await tester.enterText(
+      find.byKey(const ValueKey('ai-prompt-input')),
+      'Añade Factura',
+    );
+    await tester.tap(find.byKey(const ValueKey('ai-send')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('ai-confirm')));
+    await tester.pumpAndSettle();
+
+    expect(find.byKey(const ValueKey('uml-node-invoice-node')), findsOneWidget);
+    expect(find.text('Revisión 13'), findsOneWidget);
   });
 
   testWidgets('una revisión remota se anuncia sin marcarla pendiente local', (

@@ -38,7 +38,45 @@ Para preparar evidencia reproducible de interoperabilidad se incluye un comparad
 
 ## IA
 
-Configura `AI_BASE_URL`, `AI_API_KEY` opcional, `AI_MODEL`, `AI_TIMEOUT_SECONDS` y `AI_MAX_OPERATIONS`. Los límites generales son `XMI_MAX_BYTES`, `MAX_PROJECT_ELEMENTS`, `MAX_PROJECT_RELATIONSHIPS`, `MAX_COLLABORATORS`, `MODEL_SNAPSHOT_INTERVAL` y `SNAPSHOT_RETENTION`. Sin URL, la IA queda deshabilitada sin afectar el editor manual. El contexto enviado se limita al proyecto autorizado, la selección y el registro UML. La respuesta debe ser JSON estructurado; se valida y se muestra como propuesta. `POST /api/modeling/projects/:id/ai/explain/` devuelve explicación, advertencias y sugerencias validadas sin mutar el modelo. Solo la confirmación explícita crea operaciones con origen `ai`, después de un snapshot.
+El proveedor remoto es configurable y usa Chat Completions compatible con OpenAI. La configuración inicial de `.env.example` apunta a xKiro y a Mistral Large 3, gratuito y con function calling:
+
+```dotenv
+AI_PROVIDER=xkiro
+AI_BASE_URL=https://api.xkiro.com/v1
+AI_API_KEY=pega_aqui_la_clave_creada_en_xkiro
+AI_MODEL=mistralai/mistral-large-2512
+
+# Voz local; no requiere una clave adicional
+AI_TRANSCRIPTION_BACKEND=local
+AI_TRANSCRIPTION_LOCAL_MODEL=base
+AI_TRANSCRIPTION_LOCAL_DEVICE=cpu
+AI_TRANSCRIPTION_LOCAL_COMPUTE_TYPE=int8
+AI_TRANSCRIPTION_LOCAL_CPU_THREADS=4
+AI_TRANSCRIPTION_PRELOAD=True
+```
+
+La clave se lee únicamente en Django y `.env` está excluido de Git. Nunca debe colocarse en variables `VITE_*`, React, Flutter ni archivos versionados. Después de cambiarla, recrea el backend con `docker compose up -d --build backend`.
+
+El nivel gratuito y los identificadores disponibles pertenecen al proveedor y pueden cambiar. MiniMax M3 continúa siendo compatible mediante `AI_MODEL=minimax/minimax-m3:free`, pero su ruta gratuita devolvía errores internos durante la verificación del 20 de septiembre de 2026. Para sustituir el modelo basta modificar `AI_MODEL`; también se pueden ajustar `AI_TIMEOUT_SECONDS`, `AI_MAX_TOKENS`, `AI_TEMPERATURE`, `AI_MAX_PROMPT_CHARS` y `AI_MAX_OPERATIONS` sin cambiar los clientes.
+
+Web y móvil envían la intención, el diagrama activo y la selección al mismo endpoint. El backend construye el contexto autorizado y fuerza una llamada estructurada `submit_uml_proposal`. La respuesta se trata como entrada no confiable: se validan entidades, tipos UML, referencias, dependencias, permisos y límites. La IA nunca ejecuta herramientas ni escribe directamente. Primero se guarda y presenta una propuesta; solo la confirmación explícita del usuario aplica las operaciones dentro de una transacción, crea snapshot previo, revisión e historial con origen `ai`. Lectores pueden consultar y revisar, pero no confirmar.
+
+`POST /api/modeling/projects/:id/ai/explain/` devuelve explicación, advertencias y sugerencias validadas sin mutar el modelo. Si la API no está configurada, agota cuota, falla o excede el timeout, el editor continúa funcionando y el proyecto permanece intacto.
+
+Web y móvil ofrecen un botón de micrófono dentro del asistente. El cliente graba como máximo 60 segundos y envía el archivo temporal a `POST /api/modeling/projects/:id/ai/transcriptions/`. Django valida membresía, formato y tamaño y lo transcribe dentro del contenedor con `faster-whisper`. El audio no se guarda en el proyecto y el archivo temporal se elimina siempre después del intento, tanto en Django como en móvil. La transcripción queda en el campo como borrador editable y no se envía ni aplica automáticamente.
+
+El modelo multilingüe `base` se descarga durante el primer arranque del backend y queda reutilizable en el volumen Docker `whisper_models`. Por eso la primera construcción y el primer inicio necesitan Internet; una vez almacenado el modelo, la transcripción no consume una API de audio ni requiere otra clave. El móvil sí necesita poder alcanzar el backend por red. Para preparar el contenedor y seguir la descarga:
+
+```powershell
+docker compose up -d --build backend
+docker compose logs -f backend
+```
+
+En equipos más potentes puede cambiarse `AI_TRANSCRIPTION_LOCAL_MODEL` por otro modelo compatible. El valor por defecto usa CPU con cuantización `int8` para reducir memoria y no exigir GPU.
+
+El proveedor remoto queda disponible únicamente como respaldo opcional. Para activarlo se configura `AI_TRANSCRIPTION_BACKEND=remote` junto con `AI_TRANSCRIPTION_BASE_URL`, `AI_TRANSCRIPTION_API_KEY` y `AI_TRANSCRIPTION_MODEL`. Xkiro sigue utilizándose solo para generar propuestas UML; no se necesita que soporte audio.
+
+Los límites generales son `XMI_MAX_BYTES`, `MAX_PROJECT_ELEMENTS`, `MAX_PROJECT_RELATIONSHIPS`, `MAX_COLLABORATORS`, `MODEL_SNAPSHOT_INTERVAL` y `SNAPSHOT_RETENTION`.
 
 ## Invitaciones y colaboración
 

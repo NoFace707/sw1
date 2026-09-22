@@ -8,6 +8,7 @@ El cliente móvil debe complementar al modelador web sin intentar reproducir un 
 - Permitir abrir y explorar en modo lectura los catorce tipos de diagramas UML 2.5.1 mediante zoom, desplazamiento, búsqueda, navegación entre elementos y consulta de propiedades.
 - **BREAKING**: no ofrecer herramientas móviles de dibujo, arrastre, conexión ni edición manual; toda modificación semántica o visual del modelo desde móvil deberá originarse en una propuesta de IA revisada y confirmada por el usuario.
 - Consumir en línea el mismo asistente de IA por API definido para web, manteniendo permisos, historial, validación UML y operaciones colaborativas.
+- Permitir dictar instrucciones en Android e iOS: Flutter grabará el micrófono y el backend convertirá el audio a texto mediante un proveedor Whisper compatible antes de incorporarlo como borrador editable del chat.
 - Incorporar inferencia local offline mediante un adaptador intercambiable cuya primera implementación objetivo será `llama_cpp_dart` con `Qwen2.5-Coder-1.5B-Instruct-GGUF` cuantizado `Q4_K_M`.
 - Descargar el modelo local de forma opcional y verificable, sin incluir sus aproximadamente 1,12 GB dentro de la instalación inicial; permitir pausar, reanudar, comprobar integridad, actualizar y eliminar el modelo.
 - Detectar compatibilidad y recursos del dispositivo antes de cargar IA local, ejecutar inferencia fuera del hilo de interfaz y ofrecer degradación clara a modo solo lectura si el dispositivo no puede ejecutarla.
@@ -37,7 +38,7 @@ Ninguna; las capacidades relacionadas siguen en cambios OpenSpec activos y todav
 ## Impact
 
 - Flutter añadirá navegación de proyectos, renderizador read-only de diagramas, almacenamiento local estructurado, sincronización, invitaciones, chat/propuestas de IA, gestión del modelo GGUF y exportación de ZIP.
-- Android e iOS necesitarán integración nativa de `llama.cpp`, ABI/arquitecturas soportadas, permisos/almacenamiento, descarga en segundo plano y pruebas sobre dispositivos físicos; desktop/web Flutter no forman parte de la aceptación local inicial.
+- Android e iOS necesitarán integración nativa de `llama.cpp`, ABI/arquitecturas soportadas, permiso de micrófono, almacenamiento, descarga en segundo plano y pruebas sobre dispositivos físicos; desktop/web Flutter no forman parte de la aceptación local inicial.
 - El backend Django añadirá endpoints móviles de snapshots/diagramas, sincronización, invitaciones, inferencia remota, verificación de artefactos y descarga del backend generado, reutilizando autorización e historial del modelador web.
 - PostgreSQL conservará propuestas, operaciones aceptadas, trabajos de generación y reportes; los archivos ZIP tendrán almacenamiento y vencimiento configurables.
 - La generación Spring se fijará inicialmente en Spring Boot 4.1.x, Java 21 y Maven, usando PostgreSQL y paquetes Jakarta; versiones futuras se incorporarán como perfiles de plantilla, no como texto libre del modelo.

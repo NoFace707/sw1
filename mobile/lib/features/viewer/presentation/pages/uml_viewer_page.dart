@@ -3,6 +3,13 @@ import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 
+import '../../../../core/auth/auth_session_manager.dart';
+import '../../../ai/data/mobile_ai_session_factory.dart';
+import '../../../ai/data/mobile_voice_transcriber.dart';
+import '../../../ai/domain/ai_context_builder.dart';
+import '../../../ai/domain/expert_evaluator.dart';
+import '../../../ai/domain/mobile_ai.dart';
+import '../../../ai/presentation/ai_assistant_sheet.dart';
 import '../../data/viewer_repository.dart';
 import '../../domain/viewer_models.dart';
 import '../widgets/uml_notation.dart';
@@ -14,12 +21,20 @@ class UmlViewerPage extends StatefulWidget {
     required this.repository,
     this.initialSnapshot,
     this.remoteRevisions,
+    this.aiEngine,
+    this.applyAiProposal,
+    this.supportsLocalAi,
+    this.voiceTranscriber,
   });
 
   final UmlProjectSummary project;
   final ViewerRepository repository;
   final UmlSnapshot? initialSnapshot;
   final Stream<int>? remoteRevisions;
+  final MobileAiEngine? aiEngine;
+  final ApplyAiProposal? applyAiProposal;
+  final bool? supportsLocalAi;
+  final MobileVoiceTranscriber? voiceTranscriber;
 
   @override
   State<UmlViewerPage> createState() => _UmlViewerPageState();
@@ -193,14 +208,147 @@ class _UmlViewerPageState extends State<UmlViewerPage> {
     );
   }
 
-  void _requestAiChange() {
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(
-        content: Text(
-          'Este visor es de solo lectura. Los cambios se solicitan desde el asistente de IA.',
+  Future<void> _openAiAssistant() async {
+    final snapshot = _snapshot;
+    if (snapshot == null) return;
+    MobileAiSession? session;
+    MobileVoiceTranscriber? voiceTranscriber;
+    var ownsVoiceTranscriber = false;
+    try {
+      if (widget.aiEngine != null) {
+        session = MobileAiSession(engine: widget.aiEngine!);
+      } else if (widget.repository is MobileViewerRepository) {
+        session = await MobileAiSessionFactory.createForProject(
+          widget.repository as MobileViewerRepository,
+          widget.project.id,
+        );
+      } else {
+        throw const ViewerRepositoryException(
+          'El asistente de IA no está disponible en este origen de datos.',
+        );
+      }
+      if (!mounted) return;
+      voiceTranscriber = widget.voiceTranscriber;
+      if (voiceTranscriber == null && widget.repository is MobileViewerRepository) {
+        final repository = widget.repository as MobileViewerRepository;
+        voiceTranscriber = WhisperVoiceTranscriber(
+          accessTokenProvider: AuthSessionManager.getAccessToken,
+          accessTokenRefresher: AuthSessionManager.refreshAccessToken,
+          online: repository.isOnline,
+        );
+        ownsVoiceTranscriber = true;
+      }
+      final selectedElementIds = [
+        if (_selectedNodeId != null)
+          ..._nodes
+              .where((node) => node.id == _selectedNodeId)
+              .map((node) => node.elementId)
+              .whereType<String>(),
+      ];
+      final result = await showModalBottomSheet<UmlSnapshot>(
+        context: context,
+        showDragHandle: true,
+        isScrollControlled: true,
+        useSafeArea: true,
+        builder: (_) => AiAssistantSheet(
+          engine: session!.engine,
+          snapshot: snapshot,
+          diagramId: _diagramId,
+          selectedElementIds: selectedElementIds,
+          access: widget.project.access,
+          supportsLocal:
+              widget.supportsLocalAi ?? session.engine.id == 'hybrid',
+          applyProposal:
+              widget.applyAiProposal ??
+              (proposal, selected) => _applyAiProposal(proposal, selected),
+          voiceTranscriber: voiceTranscriber,
         ),
-      ),
+      );
+      if (mounted && result != null) _acceptSnapshot(result);
+    } on ViewerRepositoryException catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(error.message)));
+      }
+    } finally {
+      if (ownsVoiceTranscriber) await voiceTranscriber?.dispose();
+      await session?.dispose();
+    }
+  }
+
+  Future<UmlSnapshot> _applyAiProposal(
+    MobileAiResponse proposal,
+    Set<String> selected,
+  ) async {
+    final repository = widget.repository;
+    if (repository is! MobileViewerRepository) {
+      throw const ViewerRepositoryException(
+        'Este origen de datos no admite cambios de IA.',
+      );
+    }
+    if (widget.project.access == ProjectAccess.viewer) {
+      throw const ViewerRepositoryException(
+        'Tu rol de lector no permite confirmar cambios.',
+      );
+    }
+    if (proposal.origin == MobileAiOrigin.remote) {
+      return repository.applyRemoteAiProposal(
+        widget.project,
+        proposal,
+        selected,
+      );
+    }
+    await repository.saveLocalProposal(widget.project.id, proposal);
+    return repository.confirmLocalProposal(
+      widget.project.id,
+      proposal,
+      selected,
     );
+  }
+
+  Future<void> _openOfflineDiagnostics() async {
+    final snapshot = _snapshot;
+    final repository = widget.repository;
+    if (snapshot == null || repository is! MobileViewerRepository) return;
+    try {
+      final rulesPayload = await repository.loadOfflineRules(widget.project.id);
+      final registry = await repository.loadOfflineRegistry(widget.project.id);
+      if (rulesPayload == null) {
+        throw const FormatException(
+          'Prepara este proyecto para uso offline antes de ejecutar el diagnóstico.',
+        );
+      }
+      final aiContext = AiContextBuilder().build(
+        snapshot: snapshot,
+        diagramId: _diagramId,
+        selectedElementIds: [
+          if (_selectedNodeId != null)
+            ..._nodes
+                .where((node) => node.id == _selectedNodeId)
+                .map((node) => node.elementId)
+                .whereType<String>(),
+        ],
+      );
+      final diagnostics = ExpertEvaluator(ExpertRuleSet.verified(rulesPayload))
+          .evaluate({
+            ...aiContext,
+            'registry': registry ?? const <String, dynamic>{},
+            'permission': widget.project.access.name,
+          });
+      if (!mounted) return;
+      await showModalBottomSheet<void>(
+        context: context,
+        showDragHandle: true,
+        isScrollControlled: true,
+        builder: (_) => _OfflineDiagnosticsSheet(diagnostics: diagnostics),
+      );
+    } on FormatException catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(error.message)));
+    }
   }
 
   @override
@@ -210,6 +358,18 @@ class _UmlViewerPageState extends State<UmlViewerPage> {
       appBar: AppBar(
         title: Text(widget.project.name, overflow: TextOverflow.ellipsis),
         actions: [
+          IconButton(
+            key: const ValueKey('viewer-ai-assistant'),
+            tooltip: 'Pedir cambios a la IA',
+            onPressed: _snapshot == null ? null : _openAiAssistant,
+            icon: const Icon(Icons.chat_bubble_outline),
+          ),
+          IconButton(
+            key: const ValueKey('viewer-offline-diagnostics'),
+            tooltip: 'Diagnóstico UML offline',
+            onPressed: _snapshot == null ? null : _openOfflineDiagnostics,
+            icon: const Icon(Icons.auto_awesome_outlined),
+          ),
           IconButton(
             key: const ValueKey('viewer-search'),
             tooltip: 'Buscar elemento',
@@ -367,7 +527,7 @@ class _UmlViewerPageState extends State<UmlViewerPage> {
                               diagramType: _diagram!.type,
                               selected: node.id == _selectedNodeId,
                               onTap: () => _inspect(node),
-                              onLongPress: _requestAiChange,
+                              onLongPress: _openAiAssistant,
                             ),
                           ),
                       ],
@@ -406,6 +566,77 @@ class _UmlViewerPageState extends State<UmlViewerPage> {
   }
 }
 
+class _OfflineDiagnosticsSheet extends StatelessWidget {
+  const _OfflineDiagnosticsSheet({required this.diagnostics});
+
+  final List<MobileAiDiagnostic> diagnostics;
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(20, 0, 20, 24),
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxHeight: 620),
+          child: ListView(
+            shrinkWrap: true,
+            children: [
+              Text(
+                'Diagnóstico UML offline',
+                style: Theme.of(context).textTheme.titleLarge,
+              ),
+              const SizedBox(height: 6),
+              const Text(
+                'Funciona con reglas locales; no necesita descargar ni ejecutar el modelo Qwen.',
+              ),
+              const Divider(height: 28),
+              if (diagnostics.isEmpty)
+                const ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  leading: Icon(
+                    Icons.check_circle_outline,
+                    color: Colors.green,
+                  ),
+                  title: Text(
+                    'No se encontraron problemas en el alcance revisado.',
+                  ),
+                ),
+              for (final diagnostic in diagnostics)
+                Card(
+                  child: ListTile(
+                    leading: Icon(
+                      diagnostic.severity == 'error'
+                          ? Icons.error_outline
+                          : Icons.warning_amber_outlined,
+                      color: diagnostic.severity == 'error'
+                          ? Colors.red
+                          : Colors.orange,
+                    ),
+                    title: Text(diagnostic.message),
+                    subtitle: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          '${diagnostic.severity.toUpperCase()} · ${diagnostic.ruleId}',
+                        ),
+                        if (diagnostic.evidence.isNotEmpty)
+                          Text('Evidencia: ${diagnostic.evidence}'),
+                        if (diagnostic.question != null)
+                          Text('Pregunta: ${diagnostic.question}'),
+                        if (diagnostic.repair != null)
+                          Text('Corrección segura: ${diagnostic.repair}'),
+                      ],
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class _ViewerStatusBar extends StatelessWidget {
   const _ViewerStatusBar({required this.snapshot});
   final UmlSnapshot snapshot;
@@ -413,7 +644,11 @@ class _ViewerStatusBar extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final state = snapshot.loadedFromOffline
-        ? ViewerSyncState.offline
+        ? switch (snapshot.project.syncState) {
+            ViewerSyncState.pending ||
+            ViewerSyncState.conflict => snapshot.project.syncState,
+            _ => ViewerSyncState.offline,
+          }
         : snapshot.project.syncState;
     final (label, icon, color) = switch (state) {
       ViewerSyncState.updated => (
@@ -426,6 +661,7 @@ class _ViewerStatusBar extends StatelessWidget {
         Icons.cloud_off_outlined,
         Colors.blueGrey,
       ),
+      ViewerSyncState.syncing => ('Sincronizando', Icons.sync, Colors.blue),
       ViewerSyncState.pending => (
         'Pendiente',
         Icons.cloud_upload_outlined,
@@ -450,7 +686,17 @@ class _ViewerStatusBar extends StatelessWidget {
               key: const ValueKey('viewer-sync-state'),
               style: TextStyle(color: color, fontWeight: FontWeight.w700),
             ),
-            const Spacer(),
+            if (snapshot.loadedFromOffline && snapshot.syncedAt != null) ...[
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  'Copia del ${_shortDateTime(snapshot.syncedAt!)}',
+                  overflow: TextOverflow.ellipsis,
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+              ),
+            ] else
+              const Spacer(),
             Text(
               'Revisión ${snapshot.project.revision}',
               key: const ValueKey('viewer-revision'),
@@ -460,6 +706,13 @@ class _ViewerStatusBar extends StatelessWidget {
       ),
     );
   }
+}
+
+String _shortDateTime(DateTime value) {
+  final local = value.toLocal();
+  String two(int number) => number.toString().padLeft(2, '0');
+  return '${two(local.day)}/${two(local.month)}/${local.year} '
+      '${two(local.hour)}:${two(local.minute)}';
 }
 
 class _InspectorSheet extends StatelessWidget {

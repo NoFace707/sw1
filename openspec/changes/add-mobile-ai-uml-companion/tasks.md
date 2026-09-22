@@ -22,10 +22,10 @@
 - [ ] 3.1 Reorganizar Flutter por capacidades `projects`, `viewer`, `collaboration`, `offline`, `ai`, `expert` y `generation`, conservando autenticación; verificar `flutter analyze` sin imports huérfanos.
 - [ ] 3.2 Añadir dependencias fijadas para HTTP/WebSocket, Drift/SQLite, rutas de soporte, conectividad, descarga reanudable, hash, ZIP y compartir; verificar resolución limpia de dependencias y builds Android/iOS.
 - [ ] 3.3 Implementar DTOs y mapeadores de los contratos compartidos con manejo de tipos desconocidos; verificar round-trip contra los fixtures JSON.
-- [ ] 3.4 Crear el esquema Drift para cuentas lógicas, proyectos, snapshots, reglas, propuestas, operaciones, conflictos, manifiestos y artefactos; verificar migración y restricciones mediante pruebas de base temporal.
-- [ ] 3.5 Implementar repositorios locales/remotos y casos de uso sin exponer mutaciones manuales desde el visor; verificar mediante prueba de arquitectura o imports que solo el flujo confirmado de operaciones puede escribir el modelo.
-- [ ] 3.6 Aislar consultas y rutas internas por `user_id`/`project_id` y cerrar repositorios al cambiar sesión; verificar que una segunda cuenta no enumera ni abre datos de la primera.
-- [ ] 3.7 Implementar observación de conectividad y estado `online`, `offline`, `syncing`, `pending` y `conflict`; verificar transiciones simulando pérdida y recuperación de red.
+- [x] 3.4 Crear el esquema Drift para cuentas lógicas, proyectos, snapshots, reglas, propuestas, operaciones, conflictos, manifiestos y artefactos; verificar migración y restricciones mediante pruebas de base temporal.
+- [x] 3.5 Implementar repositorios locales/remotos y casos de uso sin exponer mutaciones manuales desde el visor; verificar mediante prueba de arquitectura o imports que solo el flujo confirmado de operaciones puede escribir el modelo.
+- [x] 3.6 Aislar consultas y rutas internas por `user_id`/`project_id` y cerrar repositorios al cambiar sesión; verificar que una segunda cuenta no enumera ni abre datos de la primera.
+- [x] 3.7 Implementar observación de conectividad y estado `online`, `offline`, `syncing`, `pending` y `conflict`; verificar transiciones simulando pérdida y recuperación de red.
 
 ## 4. Inicio de proyectos y visor UML móvil
 
@@ -54,45 +54,47 @@
 
 ## 6. Sistema experto UML, MDA y Spring
 
-- [ ] 6.1 Definir el formato declarativo de reglas con condición, severidad, evidencia, pregunta, reparación y mapeo; verificarlo contra su JSON Schema.
-- [ ] 6.2 Crear la base inicial versionada para identidad, tipos y relaciones UML 2.5.1, trazabilidad MDA, permisos, límites y mapeos Spring; verificar cobertura de cada requisito mediante un catálogo de reglas.
-- [ ] 6.3 Implementar el evaluador autoritativo Python con diagnósticos ordenados y reparaciones permitidas; verificar fixtures positivos, negativos y resultados deterministas.
+- [x] 6.1 Definir el formato declarativo de reglas con condición, severidad, evidencia, pregunta, reparación y mapeo; verificarlo contra su JSON Schema.
+- [x] 6.2 Crear la base inicial versionada para identidad, tipos y relaciones UML 2.5.1, trazabilidad MDA, permisos, límites y mapeos Spring; verificar cobertura de cada requisito mediante un catálogo de reglas.
+- [x] 6.3 Implementar el evaluador autoritativo Python con diagnósticos ordenados y reparaciones permitidas; verificar fixtures positivos, negativos y resultados deterministas.
 - [ ] 6.4 Implementar el evaluador Dart equivalente y almacenamiento atómico de actualizaciones firmadas; verificar los mismos fixtures y conservación de la versión anterior ante actualización inválida.
-- [ ] 6.5 Implementar detección previa de datos faltantes y generación de preguntas/supuestos; verificar casos ambiguos de multiplicidad, identificador, tipo y nivel MDA.
-- [ ] 6.6 Implementar validación de propuestas por identidad, permiso, revisión, tipos, relaciones y límites; verificar que operaciones inválidas no habilitan confirmación.
+- [x] 6.5 Implementar detección previa de datos faltantes y generación de preguntas/supuestos; verificar casos ambiguos de multiplicidad, identificador, tipo y nivel MDA.
+- [x] 6.6 Implementar validación de propuestas por identidad, permiso, revisión, tipos, relaciones y límites; verificar que operaciones inválidas no habilitan confirmación.
 - [ ] 6.7 Implementar reparación determinista limitada a normalización, derivados y orden de dependencias; verificar que toda reparación se explica y se revalida.
-- [ ] 6.8 Añadir diagnóstico offline sin modelo generativo y UI de regla/severidad/evidencia/corrección; verificar recomendaciones con el GGUF ausente.
+- [x] 6.8 Añadir diagnóstico offline sin modelo generativo y UI de regla/severidad/evidencia/corrección; verificar recomendaciones con el GGUF ausente.
 
 ## 7. IA remota y revisión de propuestas
 
-- [ ] 7.1 Definir `MobileAiEngine`, solicitud saneada y respuesta estructurada comunes a motores API/local; verificar contract tests con propuestas, preguntas, advertencias y errores.
-- [ ] 7.2 Implementar el constructor de contexto mínimo desde selección y referencias, excluyendo tokens, invitaciones, secretos y otros proyectos; verificar snapshots del prompt saneado.
-- [ ] 7.3 Implementar `RemoteAiEngine` sobre la API compartida y registrar proveedor/modelo/origen; verificar éxito, indisponibilidad, timeout y cancelación sin mutaciones.
-- [ ] 7.4 Implementar conversación y preguntas aclaratorias antes de solicitar operaciones; verificar que una intención incompleta no se convierte directamente en cambio.
-- [ ] 7.5 Implementar vista de diferencias semánticas/visuales, supuestos, advertencias y reparaciones; verificar previsualización sin alterar la revisión abierta.
-- [ ] 7.6 Permitir selección parcial de operaciones compatibles y confirmación explícita; verificar que dependencias no seleccionables se explican y que solo el subconjunto final se envía.
-- [ ] 7.7 Aplicar propuestas online mediante el pipeline colaborativo y refrescar el visor; verificar permiso de editor, rechazo de lector, revisión nueva e historial atribuido.
-- [ ] 7.8 Manejar JSON inválido, respuesta parcial y cancelación descartando el lote; verificar que snapshot, cola e historial permanecen intactos.
+- [x] 7.1 Definir `MobileAiEngine`, solicitud saneada y respuesta estructurada comunes a motores API/local; verificar contract tests con propuestas, preguntas, advertencias y errores.
+- [x] 7.2 Implementar el constructor de contexto mínimo desde selección y referencias, excluyendo tokens, invitaciones, secretos y otros proyectos; verificar snapshots del prompt saneado.
+- [x] 7.3 Implementar `RemoteAiEngine` sobre la API compartida y registrar proveedor/modelo/origen; verificar éxito, indisponibilidad, timeout y cancelación sin mutaciones.
+- [x] 7.4 Implementar conversación y preguntas aclaratorias antes de solicitar operaciones; verificar que una intención incompleta no se convierte directamente en cambio.
+- [x] 7.5 Implementar vista de diferencias semánticas/visuales, supuestos, advertencias y reparaciones; verificar previsualización sin alterar la revisión abierta.
+- [x] 7.6 Permitir selección parcial de operaciones compatibles y confirmación explícita; verificar que dependencias no seleccionables se explican y que solo el subconjunto final se envía.
+- [x] 7.7 Aplicar propuestas online mediante el pipeline colaborativo y refrescar el visor; verificar permiso de editor, rechazo de lector, revisión nueva e historial atribuido.
+- [x] 7.8 Manejar JSON inválido, respuesta parcial y cancelación descartando el lote; verificar que snapshot, cola e historial permanecen intactos.
+- [x] 7.9 Añadir dictado Android/iOS con grabación temporal, permiso de micrófono, subida autenticada al endpoint Whisper compartido y texto editable previo al envío; verificar éxito, permiso denegado, modo offline, refresh de sesión, error remoto y eliminación del archivo.
+- [x] 7.10 Corregir la interoperabilidad multipart de voz móvil declarando `audio/mp4`, aceptando variantes AAC/M4A seguras en Django y cubriendo el payload móvil real para eliminar respuestas `400` antes de Whisper.
 
 ## 8. Modelo Qwen y motor local
 
 - [ ] 8.1 Fijar una versión de `llama_cpp_dart`, revisión de `llama.cpp`, ABI y opciones compatibles con Dart 3.9.2, Android arm64 e iOS arm64; verificar compilación de un harness e inferencia mínima en dispositivos físicos.
 - [ ] 8.2 Implementar `LocalLlamaEngine` detrás de `MobileAiEngine` sin filtrar APIs nativas a la UI; verificar que un motor falso y el real superan el mismo contrato.
-- [ ] 8.3 Publicar y consumir el manifiesto de `Qwen2.5-Coder-1.5B-Instruct-GGUF` `Q4_K_M` con origen, licencia, tamaño, SHA-256, chat template y contexto; verificar rechazo de metadatos alterados.
-- [ ] 8.4 Implementar consentimiento, descarga parcial, pausa, reanudación, progreso y reemplazo atómico del GGUF; verificar recuperación tras cortar red y cerrar la app.
-- [ ] 8.5 Implementar verificación de hash y acciones de reparar/actualizar/eliminar modelo sin tocar proyectos; verificar archivo corrupto, actualización fallida y liberación de espacio.
-- [ ] 8.6 Implementar comprobación de arquitectura, memoria, almacenamiento y perfil mínimo antes de cargar; verificar bloqueo seguro en dispositivos/perfiles insuficientes.
+- [x] 8.3 Publicar y consumir el manifiesto de `Qwen2.5-Coder-1.5B-Instruct-GGUF` `Q4_K_M` con origen, licencia, tamaño, SHA-256, chat template y contexto; verificar rechazo de metadatos alterados.
+- [x] 8.4 Implementar consentimiento, descarga parcial, pausa, reanudación, progreso y reemplazo atómico del GGUF; verificar recuperación tras cortar red y cerrar la app.
+- [x] 8.5 Implementar verificación de hash y acciones de reparar/actualizar/eliminar modelo sin tocar proyectos; verificar archivo corrupto, actualización fallida y liberación de espacio.
+- [x] 8.6 Implementar comprobación de arquitectura, memoria, almacenamiento y perfil mínimo antes de cargar; verificar bloqueo seguro en dispositivos/perfiles insuficientes.
 - [ ] 8.7 Ejecutar una sola inferencia en isolate/hilo nativo con streaming, progreso, cancelación y liberación; verificar que la UI sigue respondiendo y no queda una sesión tras cancelar.
-- [ ] 8.8 Configurar prompts compactos y salida JSON para Qwen, seguida del evaluador experto; verificar propuestas válidas y rechazo/reparación de salidas mal formadas.
+- [x] 8.8 Configurar prompts compactos y salida JSON para Qwen, seguida del evaluador experto; verificar propuestas válidas y rechazo/reparación de salidas mal formadas.
 - [ ] 8.9 Implementar modos automático/API/local y fallback solo lectura; verificar la matriz conexión, API disponible, GGUF instalado y dispositivo incompatible.
 - [ ] 8.10 Medir memoria, latencia, batería y temperatura en los dispositivos de aceptación y ajustar límites documentados; verificar que resultados y umbrales quedan registrados por plataforma.
 
 ## 9. Trabajo offline y sincronización
 
-- [ ] 9.1 Implementar marcar/desmarcar proyecto para offline con descarga transaccional de snapshot, registro y reglas; verificar que una interrupción no deja una copia utilizable incompleta.
-- [ ] 9.2 Abrir y navegar la última revisión local mostrando fecha de sincronización; verificar modo avión y ausencia de llamadas remotas bloqueantes.
-- [ ] 9.3 Persistir propuestas locales confirmadas como operaciones UUID idempotentes antes de proyectarlas; verificar reinicio forzado sin pérdida ni doble aplicación.
-- [ ] 9.4 Implementar proyección local y estado pendiente para operaciones IA aceptadas; verificar actualización del visor sin afirmar sincronización.
+- [x] 9.1 Implementar marcar/desmarcar proyecto para offline con descarga transaccional de snapshot, registro y reglas; verificar que una interrupción no deja una copia utilizable incompleta.
+- [x] 9.2 Abrir y navegar la última revisión local mostrando fecha de sincronización; verificar modo avión y ausencia de llamadas remotas bloqueantes.
+- [x] 9.3 Persistir propuestas locales confirmadas como operaciones UUID idempotentes antes de proyectarlas; verificar reinicio forzado sin pérdida ni doble aplicación.
+- [x] 9.4 Implementar proyección local y estado pendiente para operaciones IA aceptadas; verificar actualización del visor sin afirmar sincronización.
 - [ ] 9.5 Implementar descarga incremental, rebase y envío ordenado de la cola al reconectar; verificar cambios en propiedades distintas alcanzando la revisión canónica.
 - [ ] 9.6 Persistir y presentar conflictos de misma propiedad y eliminación frente a edición; verificar conservación de ambas alternativas y resolución autorizada.
 - [ ] 9.7 Manejar permiso de edición retirado conservando la cola y exportando recuperación; verificar que ninguna operación se fuerza al servidor.

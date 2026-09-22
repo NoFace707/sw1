@@ -62,3 +62,17 @@ La aplicación SHALL seguir permitiendo modelado manual cuando la IA no esté co
 - **WHEN** la solicitud de IA falla o excede el tiempo límite
 - **THEN** el sistema conserva el prompt para reintento, informa la falla y deja el modelo intacto
 
+### Requirement: Dictado por voz con transcripción separada
+La aplicación web SHALL permitir grabar una instrucción de voz y SHALL transcribirla mediante Whisper local en el backend, sin requerir una clave de transcripción externa. El audio MUST NOT enviarse al proveedor generativo del modelador ni persistirse como parte del proyecto, y el texto resultante MUST permanecer editable antes de solicitar una propuesta. Un proveedor Whisper compatible MAY configurarse como alternativa explícita.
+
+#### Scenario: Transcripción correcta
+- **WHEN** un miembro autorizado graba una instrucción y detiene la grabación
+- **THEN** el backend valida y reenvía temporalmente el audio al servicio de transcripción y la interfaz inserta el texto devuelto sin enviarlo automáticamente a la IA
+
+#### Scenario: Micrófono o transcripción no disponible
+- **WHEN** se deniega el permiso del micrófono, el archivo supera el límite o falla el proveedor Whisper
+- **THEN** la interfaz conserva el prompt existente, muestra un error recuperable y el proyecto permanece sin cambios
+
+#### Scenario: Modelo local descargado y reutilizado
+- **WHEN** el backend inicia por primera vez con transcripción local habilitada
+- **THEN** descarga y precarga el modelo en un volumen persistente, y los siguientes arranques reutilizan esa copia sin solicitar una clave externa

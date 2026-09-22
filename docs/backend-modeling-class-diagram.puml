@@ -1,0 +1,266 @@
+@startuml backend-modeling-class-diagram
+
+' Backend Django: modelo persistente del modelador UML colaborativo.
+title Modelo de clases - Backend de modelado UML
+
+hide empty methods
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam linetype ortho
+skinparam packageStyle rectangle
+skinparam class {
+  BackgroundColor #F8FAFC
+  BorderColor #334155
+  ArrowColor #475569
+  FontColor #0F172A
+}
+skinparam package {
+  BackgroundColor #E2E8F0
+  BorderColor #64748B
+  FontColor #0F172A
+}
+
+package "Django Auth" <<External>> {
+  class User <<Django auth>> {
+    +id: integer
+    +username: string
+  }
+}
+
+package "Proyectos y acceso" {
+  class Project {
+    +id: UUID
+    +name: string
+    +description: text
+    +mda_level: MdaLevel
+    +revision: bigint
+    +created_at: datetime
+    +updated_at: datetime
+  }
+
+  enum MdaLevel {
+    CIM
+    PIM
+    PSM
+    UNSPECIFIED
+  }
+
+  class ProjectMembership {
+    +id: UUID
+    +role: Role
+    +joined_at: datetime
+  }
+
+  enum MembershipRole {
+    OWNER
+    EDITOR
+    VIEWER
+  }
+
+  class InviteCode {
+    +id: UUID
+    +code_hash: string
+    +code_hint: string
+    +role: MembershipRole
+    +expires_at: datetime
+    +max_uses: integer
+    +uses_count: integer
+    +revoked_at: datetime
+    +created_at: datetime
+  }
+}
+
+package "Modelo semántico UML" {
+  class UmlPackage {
+    +id: UUID
+    +name: string
+    +mda_level: MdaLevel
+    +properties: JSON
+    +created_at: datetime
+    +updated_at: datetime
+  }
+
+  class UmlElement {
+    +id: UUID
+    +metaclass: string
+    +name: string
+    +properties: JSON
+    +external_ids: JSON
+    +created_at: datetime
+    +updated_at: datetime
+  }
+
+  class UmlRelationship {
+    +id: UUID
+    +relationship_type: string
+    +properties: JSON
+    +external_ids: JSON
+    +created_at: datetime
+  }
+}
+
+package "Vistas de diagrama" {
+  class Diagram {
+    +id: UUID
+    +name: string
+    +diagram_type: string
+    +properties: JSON
+    +created_at: datetime
+    +updated_at: datetime
+  }
+
+  class DiagramNode {
+    +id: UUID
+    +x: float
+    +y: float
+    +width: float
+    +height: float
+    +properties: JSON
+  }
+
+  class DiagramEdge {
+    +id: UUID
+    +properties: JSON
+  }
+}
+
+package "Colaboración y versionado" {
+  class ModelOperation {
+    +operation_id: UUID
+    +origin: OperationOrigin
+    +entity_type: string
+    +entity_id: UUID
+    +action: string
+    +path: string
+    +base_revision: bigint
+    +previous_value: JSON
+    +new_value: JSON
+    +server_revision: bigint
+    +created_at: datetime
+  }
+
+  enum OperationOrigin {
+    USER
+    IMPORT
+    AI
+    RESTORE
+  }
+
+  class ProjectSnapshot {
+    +id: UUID
+    +revision: bigint
+    +payload: JSON
+    +reason: string
+    +created_at: datetime
+  }
+
+  class SyncConflict {
+    +id: UUID
+    +entity_type: string
+    +entity_id: UUID
+    +path: string
+    +rejected_value: JSON
+    +resolved_at: datetime
+  }
+}
+
+package "Integraciones e IA" {
+  class ExternalIdentifier {
+    +id: UUID
+    +provider: string
+    +external_id: string
+    +entity_type: string
+    +entity_id: UUID
+  }
+
+  class AiProposal {
+    +id: UUID
+    +prompt: text
+    +context: JSON
+    +proposal: JSON
+    +warnings: JSON
+    +status: ProposalStatus
+    +created_at: datetime
+    +updated_at: datetime
+  }
+
+  enum ProposalStatus {
+    DRAFT
+    READY
+    APPLIED
+    CANCELLED
+    INVALID
+  }
+
+  class MetaclassRegistry {
+    +version: string
+    +diagram_type: string
+    +definitions: JSON
+    +created_at: datetime
+  }
+}
+
+' Propiedad y acceso
+User "1" <-- "0..*" Project : owner
+Project "1" *-- "0..*" ProjectMembership : memberships
+User "1" <-- "0..*" ProjectMembership : user
+Project "1" *-- "0..*" InviteCode : invite_codes
+User "1" <-- "0..*" InviteCode : created_by
+
+' Modelo UML
+Project "1" *-- "0..*" UmlPackage : packages
+UmlPackage "0..1" o-- "0..*" UmlPackage : parent / children
+Project "1" *-- "0..*" UmlElement : elements
+UmlPackage "0..1" o-- "0..*" UmlElement : package
+User "0..1" <-- "0..*" UmlElement : created_by
+Project "1" *-- "0..*" UmlRelationship : relationships
+UmlElement "1" <-- "0..*" UmlRelationship : source
+UmlElement "1" <-- "0..*" UmlRelationship : target
+
+' Vistas y trazado visual
+Project "1" *-- "0..*" Diagram : diagrams
+User "0..1" <-- "0..*" Diagram : created_by
+Diagram "1" *-- "0..*" DiagramNode : nodes
+UmlElement "0..1" <-- "0..*" DiagramNode : element
+Diagram "1" *-- "0..*" DiagramEdge : edges
+DiagramNode "1" <-- "0..*" DiagramEdge : source_node
+DiagramNode "1" <-- "0..*" DiagramEdge : target_node
+UmlRelationship "0..1" <-- "0..*" DiagramEdge : relationship
+
+' Historial, snapshots y conflictos
+Project "1" *-- "0..*" ModelOperation : operations
+User "0..1" <-- "0..*" ModelOperation : author
+Project "1" *-- "0..*" ProjectSnapshot : snapshots
+User "0..1" <-- "0..*" ProjectSnapshot : created_by
+Project "1" *-- "0..*" SyncConflict : conflicts
+ModelOperation "1" <-- "0..*" SyncConflict : accepted_operation
+User "0..1" <-- "0..*" SyncConflict : rejected_author
+
+' Integraciones
+Project "1" *-- "0..*" ExternalIdentifier : external_identifiers
+Project "1" *-- "0..*" AiProposal : ai_proposals
+User "1" <-- "0..*" AiProposal : requested_by
+
+note right of ExternalIdentifier
+  entity_type + entity_id forman una
+  referencia polimórfica a una entidad
+  del proyecto; no es una FK Django.
+end note
+
+note right of ModelOperation
+  entity_type + entity_id identifican
+  la entidad afectada de forma polimórfica.
+end note
+
+note right of MetaclassRegistry
+  Registro independiente versionado por
+  (version, diagram_type). No tiene FK
+  directa con Project.
+end note
+
+note bottom of ProjectMembership
+  Restricciones: (project, user) único;
+  un único OWNER por proyecto.
+end note
+
+@enduml

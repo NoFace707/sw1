@@ -121,6 +121,14 @@ Se creará snapshot antes de importaciones, restauraciones y lotes de IA, y peri
 
 Límites iniciales configurables: archivo XMI de 10 MB, 2.000 elementos semánticos por proyecto, 10 colaboradores conectados y lotes de IA de 200 operaciones. Los excesos se rechazan con mensajes claros en vez de degradar silenciosamente. Se registrarán métricas técnicas de importación, sync y proveedor IA sin almacenar tokens ni códigos de invitación.
 
+### 10. Voz como entrada transcrita, no como capacidad del modelo UML
+
+Web y Flutter capturarán audio únicamente bajo acción explícita del usuario. Django expondrá un endpoint autenticado por proyecto que aceptará formatos de audio permitidos y, sin persistirlos, los reenviará como `multipart/form-data` a una ruta Whisper compatible `/audio/transcriptions`. URL, clave, modelo, timeout y tamaño máximo serán configurables por separado de la IA generativa, con posibilidad de reutilizar la clave general solo cuando el despliegue lo decida.
+
+La transcripción devuelta se insertará como borrador editable y nunca creará una propuesta ni una operación por sí sola. Esta separación permite usar proveedores distintos para voz y razonamiento, evita exponer claves en web/móvil y mantiene la confirmación humana existente. La primera entrega requiere conexión; no incorpora Whisper dentro del dispositivo.
+
+El despliegue predeterminado ejecutará `faster-whisper` dentro del backend con CPU e inferencia `int8`. El modelo multilingüe se descargará una sola vez, se conservará en un volumen Docker y se precargará al iniciar el servidor para que una petición web o móvil no tenga que esperar la descarga. El audio se escribirá únicamente en un archivo temporal durante la inferencia y se eliminará en un bloque de limpieza. El adaptador remoto compatible con `/audio/transcriptions` seguirá disponible mediante configuración explícita, pero no será obligatorio ni el valor predeterminado.
+
 ## Risks / Trade-offs
 
 - [Cubrir catorce diagramas en una sola entrega es un alcance grande] → Implementar por familias sobre un metamodelo y protocolo comunes, con fixtures/aceptación por cada tipo antes de marcarlo completo.

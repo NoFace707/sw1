@@ -1,9 +1,9 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAuth } from "../context/AuthContext";
-import { createProject, importNewProject, joinProject, listProjects } from "../domains/projects/projectsApi.js";
+import { createProject, deleteProject, importNewProject, joinProject, listProjects } from "../domains/projects/projectsApi.js";
 import { useOnlineStatus } from "../domains/sync/useOnlineStatus.js";
-import { cacheProject, listCachedProjectRecords, setProjectOffline } from "../domains/sync/offlineDb.js";
+import { cacheProject, deleteCachedProjectData, listCachedProjectRecords, setProjectOffline } from "../domains/sync/offlineDb.js";
 
 function errorMessage(cause, fallback) {
   if (typeof cause?.detail === "string") return cause.detail;
@@ -22,6 +22,7 @@ export default function HomePage() {
   const [code, setCode] = useState("");
   const [importFile, setImportFile] = useState(null);
   const [busy, setBusy] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState(null);
 
   async function loadProjects() {
     try {
@@ -77,16 +78,32 @@ export default function HomePage() {
     } catch (cause) { setError(cause?.message || "No se pudo actualizar la disponibilidad offline."); }
   }
 
+  async function handleDeleteProject() {
+    if (!deleteTarget || busy) return;
+    if (!online) { setError("Conéctate para eliminar el proyecto."); return; }
+    const projectId = String(deleteTarget.id);
+    try {
+      setBusy(true); setError("");
+      await deleteProject(projectId);
+      await deleteCachedProjectData(user?.id || "session", projectId).catch(() => undefined);
+      setProjects((current) => current?.filter((item) => String(item.id) !== projectId) || []);
+      setOfflineProjects((current) => { const next = new Set(current); next.delete(projectId); return next; });
+      setDeleteTarget(null);
+    } catch (cause) { setError(errorMessage(cause, "No se pudo eliminar el proyecto.")); }
+    finally { setBusy(false); }
+  }
+
   async function handleLogout() { await logout(); navigate("/login", { replace: true }); }
 
   return <main className="min-h-screen bg-slate-50 text-slate-800">
     <header className="border-b border-slate-200 bg-white"><div className="mx-auto flex max-w-7xl items-center justify-between px-6 py-4"><div><p className="text-xs font-semibold uppercase tracking-[0.25em] text-teal-700">Modelador UML</p><h1 className="mt-1 text-xl font-bold text-slate-900">Mis proyectos</h1></div><div className="flex items-center gap-3 text-sm"><span className={`rounded-full px-3 py-1 ${online ? "bg-emerald-50 text-emerald-700" : "bg-amber-50 text-amber-700"}`}>{online ? "En línea" : "Sin conexión"}</span><span className="hidden text-slate-500 sm:inline">{user?.email}</span><button className="rounded-lg border border-slate-300 px-3 py-2 font-semibold" type="button" onClick={handleLogout}>Salir</button></div></div></header>
     <section className="mx-auto max-w-7xl px-6 py-8">
       <div className="flex flex-wrap items-end justify-between gap-4"><div><p className="text-sm text-slate-500">Espacio de trabajo</p><h2 className="mt-1 text-3xl font-bold text-slate-900">Construye tus modelos UML</h2></div><div className="flex flex-wrap gap-2"><button className="rounded-xl bg-teal-700 px-4 py-2.5 font-semibold text-white disabled:opacity-50" type="button" disabled={busy || !online} onClick={handleCreate}>{busy ? "Creando…" : "Nuevo proyecto"}</button><button className="rounded-xl border border-slate-300 bg-white px-4 py-2.5 font-semibold" type="button" onClick={() => { setDialog("join"); setError(""); }}>Unirse con código</button><button className="rounded-xl border border-slate-300 bg-white px-4 py-2.5 font-semibold" type="button" onClick={() => { setDialog("import"); setError(""); }}>Importar</button></div></div>
-      {error && !dialog && <p className="mt-6 rounded-xl bg-rose-50 px-4 py-3 text-sm text-rose-700" role="alert">{error}</p>}
-      {projects === null ? <div className="mt-10 rounded-2xl border border-dashed border-slate-300 bg-white p-10 text-center text-slate-500">Cargando proyectos…</div> : projects.length === 0 ? <div className="mt-10 rounded-2xl border border-dashed border-slate-300 bg-white p-12 text-center"><p className="text-lg font-semibold">Todavía no participas en ningún proyecto</p><p className="mt-2 text-sm text-slate-500">Crea un modelo nuevo, importa XMI o usa un código de invitación.</p></div> : <div className="mt-8 grid gap-4 md:grid-cols-2 xl:grid-cols-3">{projects.map((item) => <article key={item.id} className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm transition hover:border-teal-300 hover:shadow-md"><button type="button" onClick={() => navigate(`/projects/${item.id}`)} className="block w-full text-left"><h3 className="text-lg font-bold text-slate-900">{item.name}</h3><p className="mt-3 line-clamp-2 min-h-10 text-sm text-slate-500">{item.description || "Sin descripción todavía."}</p><div className="mt-5 flex justify-between text-xs text-slate-400"><span>{item.membership_role}</span><span>Revisión {item.revision}</span></div></button><button type="button" onClick={() => toggleOffline(item)} className={`mt-4 w-full rounded-lg border px-3 py-2 text-xs font-semibold ${offlineProjects.has(String(item.id)) ? "border-emerald-300 text-emerald-700" : "border-slate-300 text-slate-600"}`}>{offlineProjects.has(String(item.id)) ? "Disponible offline" : "Preparar para offline"}</button></article>)}</div>}
+      {error && !dialog && !deleteTarget && <p className="mt-6 rounded-xl bg-rose-50 px-4 py-3 text-sm text-rose-700" role="alert">{error}</p>}
+      {projects === null ? <div className="mt-10 rounded-2xl border border-dashed border-slate-300 bg-white p-10 text-center text-slate-500">Cargando proyectos…</div> : projects.length === 0 ? <div className="mt-10 rounded-2xl border border-dashed border-slate-300 bg-white p-12 text-center"><p className="text-lg font-semibold">Todavía no participas en ningún proyecto</p><p className="mt-2 text-sm text-slate-500">Crea un modelo nuevo, importa XMI o usa un código de invitación.</p></div> : <div className="mt-8 grid gap-4 md:grid-cols-2 xl:grid-cols-3">{projects.map((item) => <article key={item.id} className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm transition hover:border-teal-300 hover:shadow-md"><button type="button" onClick={() => navigate(`/projects/${item.id}`)} className="block w-full text-left"><h3 className="text-lg font-bold text-slate-900">{item.name}</h3><p className="mt-3 line-clamp-2 min-h-10 text-sm text-slate-500">{item.description || "Sin descripción todavía."}</p><div className="mt-5 flex justify-between text-xs text-slate-400"><span>{item.membership_role}</span><span>Revisión {item.revision}</span></div></button><div className="mt-4 flex gap-2"><button type="button" onClick={() => toggleOffline(item)} className={`min-w-0 flex-1 rounded-lg border px-3 py-2 text-xs font-semibold ${offlineProjects.has(String(item.id)) ? "border-emerald-300 text-emerald-700" : "border-slate-300 text-slate-600"}`}>{offlineProjects.has(String(item.id)) ? "Disponible offline" : "Preparar para offline"}</button>{item.membership_role === "owner" && <button type="button" onClick={() => { setDeleteTarget(item); setError(""); }} className="rounded-lg border border-rose-200 px-3 py-2 text-xs font-semibold text-rose-700 hover:bg-rose-50" aria-label={`Eliminar ${item.name}`}>Eliminar</button>}</div></article>)}</div>}
     </section>
     {dialog === "join" && <div className="fixed inset-0 z-20 grid place-items-center bg-slate-900/30 p-4"><form onSubmit={handleJoin} className="w-full max-w-md rounded-2xl bg-white p-6 shadow-xl"><h2 className="text-xl font-bold">Unirse a un proyecto</h2><p className="mt-2 text-sm text-slate-500">Introduce el código completo que compartió el propietario.</p><label className="mt-5 block text-sm font-semibold">Código<input className="mt-2 w-full rounded-lg border border-slate-300 px-3 py-2" value={code} onChange={(event) => setCode(event.target.value)} autoFocus /></label>{error && <p className="mt-3 rounded-lg bg-rose-50 p-3 text-sm text-rose-700" role="alert">{error}</p>}<div className="mt-6 flex justify-end gap-2"><button className="rounded-lg px-4 py-2" type="button" onClick={() => setDialog(null)}>Cancelar</button><button className="rounded-lg bg-teal-700 px-4 py-2 font-semibold text-white disabled:opacity-50" type="submit" disabled={busy || !code.trim()}>{busy ? "Uniendo…" : "Unirse"}</button></div></form></div>}
     {dialog === "import" && <div className="fixed inset-0 z-20 grid place-items-center bg-slate-900/30 p-4"><form onSubmit={handleImport} className="w-full max-w-lg rounded-2xl bg-white p-6 shadow-xl"><h2 className="text-xl font-bold">Importar modelo</h2><p className="mt-2 text-sm text-slate-500">El archivo OMG XMI 2.5.1 se valida antes de crear el proyecto; si falla no quedará un proyecto vacío.</p><label className="mt-5 block text-sm font-semibold">Archivo XMI<input className="mt-2 block w-full rounded-lg border border-slate-300 px-3 py-2" type="file" accept=".xmi,.xml" onChange={(event) => setImportFile(event.target.files?.[0] || null)} required /></label>{error && <p className="mt-3 rounded-lg bg-rose-50 p-3 text-sm text-rose-700" role="alert">{error}</p>}<div className="mt-6 flex justify-end gap-2"><button className="rounded-lg px-4 py-2" type="button" onClick={() => setDialog(null)}>Cancelar</button><button className="rounded-lg bg-teal-700 px-4 py-2 font-semibold text-white disabled:opacity-50" type="submit" disabled={busy || !importFile}>{busy ? "Importando…" : "Importar"}</button></div></form></div>}
+    {deleteTarget && <div className="fixed inset-0 z-30 grid place-items-center bg-slate-900/35 p-4"><div className="w-full max-w-md rounded-2xl bg-white p-6 shadow-xl"><h2 className="text-xl font-bold text-slate-900">Eliminar proyecto</h2><p className="mt-3 text-sm text-slate-600">¿Quieres eliminar <strong>«{deleteTarget.name}»</strong>? Se borrarán sus diagramas, objetos y acceso de colaboradores. Esta acción no se puede deshacer.</p>{error && <p className="mt-3 rounded-lg bg-rose-50 p-3 text-sm text-rose-700" role="alert">{error}</p>}<div className="mt-6 flex justify-end gap-2"><button className="rounded-lg px-4 py-2" type="button" disabled={busy} onClick={() => { setDeleteTarget(null); setError(""); }}>Cancelar</button><button className="rounded-lg bg-rose-700 px-4 py-2 font-semibold text-white disabled:opacity-50" type="button" disabled={busy || !online} onClick={handleDeleteProject}>{busy ? "Eliminando…" : "Eliminar proyecto"}</button></div></div></div>}
   </main>;
 }

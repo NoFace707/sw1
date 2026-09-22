@@ -110,3 +110,10 @@
 - [x] 12.6 Ampliar exclusivamente el catálogo UML de los catorce diagramas con variantes semánticas, tamaños y geometrías específicas; verificar registro backend, 24 pruebas frontend, build y creación E2E de variantes.
 - [x] 12.7 Añadir Actor y una clase con compartimento de atributos preconfigurado a la paleta del diagrama de clases; verificar persistencia semántica, render y cobertura automatizada.
 - [x] 12.8 Permitir editar, añadir y eliminar atributos de cualquier Clase UML desde el inspector, con crecimiento automático, validación backend, persistencia y sincronización; verificar pruebas unitarias, API y E2E Chromium.
+
+## 13. Entrada por voz para el asistente
+
+- [x] 13.1 Añadir transcripción autenticada por proyecto mediante un proveedor Whisper compatible, con configuración independiente, formatos permitidos, límite de tamaño y descarte inmediato del audio; verificar éxito, autorización, configuración ausente, tipo inválido, exceso de tamaño y error remoto sin mutaciones.
+- [x] 13.2 Añadir grabación web con permiso explícito, estados grabando/transcribiendo, límite temporal y texto editable antes de enviar; verificar cancelación, error de micrófono y que transcribir no crea propuestas.
+- [x] 13.3 Documentar variables y ejecutar suites backend/frontend y build web relacionados con voz.
+- [x] 13.4 Integrar `faster-whisper` local en Docker con CPU `int8`, modelo multilingüe, caché persistente, precarga, archivo temporal eliminado y fallback remoto opcional; verificar inferencia simulada, limpieza, configuración, suite backend y consumo sin cambios desde web/móvil.

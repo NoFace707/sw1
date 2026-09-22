@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 import secrets
 import uuid
 from pathlib import Path
@@ -24,8 +25,14 @@ from .registry import DIAGRAM_TYPES, RELATIONSHIP_TYPES, registry_payload
 from .serializers import (ConflictSerializer, DiagramEdgeSerializer, DiagramNodeSerializer, DiagramSerializer, ElementSerializer, InviteSerializer, MembershipSerializer, OperationSerializer, PackageSerializer, ProjectSerializer, RelationshipSerializer, SnapshotSerializer, CreateProjectSerializer)
 from .services import record_operation, snapshot_project
 from .validators import ValidationResult, result_payload, validate_element, validate_relationship
-from .ai import AiProviderError, authorized_context, request_explanation, request_proposal
+from .ai import AiProviderError, authorized_context, request_explanation, request_proposal, validate_proposal
 from .interchange import parse_exchange, write_exchange
+from .expert_rules import expert_rules_payload
+from .local_model_manifest import local_model_manifest_payload
+from .transcription import TranscriptionError, transcribe_audio
+
+
+logger = logging.getLogger(__name__)
 
 
 def _project_or_404(user, project_id):
@@ -42,6 +49,18 @@ def _project_or_404(user, project_id):
 @permission_classes([IsAuthenticated])
 def registry(request):
     return Response(registry_payload())
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def expert_rules(request):
+    return Response(expert_rules_payload())
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def local_model_manifest(request):
+    return Response(local_model_manifest_payload())
 
 
 @api_view(["GET", "POST"])
@@ -556,7 +575,7 @@ def _read_exchange_request(request):
     return parsed, uploaded_file
 
 
-def _apply_parsed_exchange(*, project, user, parsed, import_mode, profile):
+def _apply_parsed_exchange(*, project, user, parsed, import_mode, profile, target_diagram=None):
     snapshot = snapshot_project(project, reason="before_import", created_by=user)
     package_map = {}
     for item in parsed["packages"]:
@@ -588,23 +607,24 @@ def _apply_parsed_exchange(*, project, user, parsed, import_mode, profile):
                 relationship.properties = item.get("properties") or {}
                 relationship.external_ids = item.get("external_ids") or relationship.external_ids
                 relationship.save(update_fields=("relationship_type", "source", "target", "properties", "external_ids"))
-    imported_diagrams = []
-    diagram_map = {}
-    for item in parsed["diagrams"]:
-        diagram = project.diagrams.filter(properties__xmi_id=item["id"]).first() if import_mode == "update" else None
-        if diagram is None:
-            properties = item.get("properties") or {}
-            properties.setdefault("xmi_id", item["id"])
-            if parsed.get("opaque_extensions"):
-                properties.setdefault("opaque_extensions", parsed["opaque_extensions"])
-            diagram = Diagram.objects.create(project=project, name=item["name"], diagram_type=item.get("diagram_type", "class"), properties=properties, created_by=user)
-        else:
-            diagram.name = item["name"]
-            diagram.diagram_type = item.get("diagram_type", "class")
-            diagram.properties = item.get("properties") or diagram.properties
-            diagram.save(update_fields=("name", "diagram_type", "properties", "updated_at"))
-        imported_diagrams.append(diagram)
-        diagram_map[item["id"]] = diagram
+    imported_diagrams = [target_diagram] if target_diagram else []
+    diagram_map = {item["id"]: target_diagram for item in parsed["diagrams"]} if target_diagram else {}
+    if target_diagram is None:
+        for item in parsed["diagrams"]:
+            diagram = project.diagrams.filter(properties__xmi_id=item["id"]).first() if import_mode == "update" else None
+            if diagram is None:
+                properties = item.get("properties") or {}
+                properties.setdefault("xmi_id", item["id"])
+                if parsed.get("opaque_extensions"):
+                    properties.setdefault("opaque_extensions", parsed["opaque_extensions"])
+                diagram = Diagram.objects.create(project=project, name=item["name"], diagram_type=item.get("diagram_type", "class"), properties=properties, created_by=user)
+            else:
+                diagram.name = item["name"]
+                diagram.diagram_type = item.get("diagram_type", "class")
+                diagram.properties = item.get("properties") or diagram.properties
+                diagram.save(update_fields=("name", "diagram_type", "properties", "updated_at"))
+            imported_diagrams.append(diagram)
+            diagram_map[item["id"]] = diagram
     if imported_diagrams and not parsed.get("has_presentation"):
         for diagram in imported_diagrams:
             for index, element in enumerate(element_map.values()):
@@ -614,7 +634,7 @@ def _apply_parsed_exchange(*, project, user, parsed, import_mode, profile):
         for view in parsed["views"]:
             if view["kind"] != "node":
                 continue
-            diagram = diagram_map.get(view.get("diagram_id"))
+            diagram = target_diagram or diagram_map.get(view.get("diagram_id"))
             element = element_map.get(view.get("element_id"))
             if diagram:
                 node = DiagramNode.objects.create(diagram=diagram, element=element, x=view.get("x", 0), y=view.get("y", 0), width=view.get("width", 180), height=view.get("height", 80))
@@ -622,7 +642,7 @@ def _apply_parsed_exchange(*, project, user, parsed, import_mode, profile):
         for view in parsed["views"]:
             if view["kind"] != "edge":
                 continue
-            diagram = diagram_map.get(view.get("diagram_id"))
+            diagram = target_diagram or diagram_map.get(view.get("diagram_id"))
             source = node_map.get(view.get("source_node_id"))
             target = node_map.get(view.get("target_node_id"))
             if diagram and source and target:
@@ -643,14 +663,23 @@ def import_interchange(request, project_id):
     except (ValueError, TypeError) as exc:
         return Response({"errors": [str(exc)], "warnings": [], "applied": False}, status=status.HTTP_400_BAD_REQUEST)
     import_mode = request.data.get("mode", "update")
-    if import_mode not in {"copy", "update"}:
-        return Response({"errors": ["El modo de importación debe ser copy o update."], "warnings": [], "applied": False}, status=status.HTTP_400_BAD_REQUEST)
+    if import_mode not in {"copy", "update", "overlay"}:
+        return Response({"errors": ["El modo de importación debe ser copy, update u overlay."], "warnings": [], "applied": False}, status=status.HTTP_400_BAD_REQUEST)
+    target_diagram = None
+    if import_mode == "overlay":
+        target_diagram_id = request.data.get("target_diagram_id")
+        try:
+            target_diagram = project.diagrams.get(pk=target_diagram_id)
+        except (Diagram.DoesNotExist, ValueError, TypeError):
+            return Response({"errors": ["El diagrama de destino no pertenece al proyecto."], "warnings": [], "applied": False}, status=status.HTTP_400_BAD_REQUEST)
     parsed["matches"] = [{"kind": "element", "external_id": item["id"], "name": item["name"]} for item in parsed["elements"] if project.elements.filter(external_ids__xmi=item["id"]).exists()]
     parsed["mode"] = import_mode
+    if target_diagram:
+        parsed["target_diagram"] = {"id": str(target_diagram.id), "name": target_diagram.name}
     if request.data.get("preview", "false") in {True, "true", "1", 1}:
         return Response({**parsed, "applied": False})
     with transaction.atomic():
-        snapshot, operation = _apply_parsed_exchange(project=project, user=request.user, parsed=parsed, import_mode=import_mode, profile=request.data.get("profile", "omg-xmi-2.5.1"))
+        snapshot, operation = _apply_parsed_exchange(project=project, user=request.user, parsed=parsed, import_mode=import_mode, profile=request.data.get("profile", "omg-xmi-2.5.1"), target_diagram=target_diagram)
     return Response({**parsed, "applied": True, "snapshot_id": str(snapshot.id), "revision": operation.server_revision}, status=status.HTTP_201_CREATED)
 
 
@@ -680,13 +709,59 @@ def ai_proposals(request, project_id):
     prompt = str(request.data.get("prompt", "")).strip()
     if not prompt:
         return Response({"detail": "El prompt es obligatorio."}, status=status.HTTP_400_BAD_REQUEST)
-    context = authorized_context(project, selection=request.data.get("selection", []))
+    if len(prompt) > int(getattr(settings, "AI_MAX_PROMPT_CHARS", 4000)):
+        return Response({"detail": "La solicitud de IA es demasiado extensa."}, status=status.HTTP_400_BAD_REQUEST)
+    diagram = None
+    diagram_id = request.data.get("diagram_id")
+    if diagram_id:
+        try:
+            diagram = project.diagrams.get(pk=diagram_id)
+        except (Diagram.DoesNotExist, ValueError, TypeError):
+            return Response({"detail": "El diagrama indicado no pertenece al proyecto."}, status=status.HTTP_400_BAD_REQUEST)
+    context = authorized_context(project, diagram=diagram, selection=request.data.get("selection", []))
     try:
         proposal = request_proposal(prompt, context)
     except AiProviderError as exc:
         return Response({"detail": str(exc), "code": "ai_unavailable"}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
     item = AiProposal.objects.create(project=project, requested_by=request.user, prompt=prompt, context=context, proposal=proposal, warnings=proposal.get("warnings", []), status=AiProposal.Status.READY)
-    return Response({"id": str(item.id), "proposal": proposal, "warnings": item.warnings, "status": item.status}, status=status.HTTP_201_CREATED)
+    return Response({
+        "id": str(item.id),
+        "proposal": proposal,
+        "warnings": item.warnings,
+        "status": item.status,
+        "origin": "remote",
+        "provider": getattr(settings, "AI_PROVIDER", "openai-compatible"),
+        "model": getattr(settings, "AI_MODEL", "mistralai/mistral-large-2512"),
+    }, status=status.HTTP_201_CREATED)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def ai_transcription(request, project_id):
+    project = _project_or_404(request.user, project_id)
+    require_membership(request.user, project)
+    uploaded_file = request.FILES.get("audio")
+    if uploaded_file is None:
+        logger.warning(
+            "Transcripción móvil rechazada: falta el campo de audio (proyecto=%s, usuario=%s).",
+            project.id,
+            request.user.id,
+        )
+        return Response({"detail": "Debes adjuntar un archivo de audio."}, status=status.HTTP_400_BAD_REQUEST)
+    try:
+        result = transcribe_audio(uploaded_file, language=request.data.get("language", "es"))
+    except TranscriptionError as exc:
+        logger.warning(
+            "Transcripción rechazada (proyecto=%s, usuario=%s): %s",
+            project.id,
+            request.user.id,
+            exc,
+        )
+        code = status.HTTP_413_REQUEST_ENTITY_TOO_LARGE if "tamaño máximo" in str(exc) else status.HTTP_503_SERVICE_UNAVAILABLE
+        if "formato" in str(exc) or "vacío" in str(exc):
+            code = status.HTTP_400_BAD_REQUEST
+        return Response({"detail": str(exc), "code": "transcription_unavailable"}, status=code)
+    return Response(result)
 
 
 @api_view(["POST"])
@@ -697,12 +772,166 @@ def ai_explain(request, project_id):
     prompt = str(request.data.get("prompt", "")).strip()
     if not prompt:
         return Response({"detail": "El prompt es obligatorio."}, status=status.HTTP_400_BAD_REQUEST)
-    context = authorized_context(project, selection=request.data.get("selection", []))
+    if len(prompt) > int(getattr(settings, "AI_MAX_PROMPT_CHARS", 4000)):
+        return Response({"detail": "La solicitud de IA es demasiado extensa."}, status=status.HTTP_400_BAD_REQUEST)
+    diagram = None
+    diagram_id = request.data.get("diagram_id")
+    if diagram_id:
+        try:
+            diagram = project.diagrams.get(pk=diagram_id)
+        except (Diagram.DoesNotExist, ValueError, TypeError):
+            return Response({"detail": "El diagrama indicado no pertenece al proyecto."}, status=status.HTTP_400_BAD_REQUEST)
+    context = authorized_context(project, diagram=diagram, selection=request.data.get("selection", []))
     try:
         result = request_explanation(prompt, context)
     except AiProviderError as exc:
         return Response({"detail": str(exc), "code": "ai_unavailable"}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
     return Response({**result, "context_scope": {"project_id": str(project.id), "selection_count": len(context.get("selection", []))}})
+
+
+_AI_ENTITY_CONFIG = {
+    "UmlPackage": (UmlPackage, PackageSerializer, {"project": "project"}),
+    "UmlElement": (UmlElement, ElementSerializer, {"project": "project", "created_by": "user"}),
+    "UmlRelationship": (UmlRelationship, RelationshipSerializer, {"project": "project"}),
+    "Diagram": (Diagram, DiagramSerializer, {"project": "project", "created_by": "user"}),
+    "DiagramNode": (DiagramNode, DiagramNodeSerializer, {}),
+    "DiagramEdge": (DiagramEdge, DiagramEdgeSerializer, {}),
+}
+
+
+def _ai_operation_value(entity_type, raw):
+    value = dict(raw or {})
+    aliases = {
+        "UmlPackage": {"parent_id": "parent"},
+        "UmlElement": {"package_id": "package"},
+        "UmlRelationship": {"source_id": "source", "target_id": "target", "type": "relationship_type"},
+        "Diagram": {"type": "diagram_type"},
+        "DiagramNode": {"diagram_id": "diagram", "element_id": "element"},
+        "DiagramEdge": {
+            "diagram_id": "diagram",
+            "relationship_id": "relationship",
+            "source_node_id": "source_node",
+            "target_node_id": "target_node",
+        },
+    }.get(entity_type, {})
+    for source, target in aliases.items():
+        if source in value and target not in value:
+            value[target] = value[source]
+        value.pop(source, None)
+    for field in ("id", "project", "created_by", "created_at", "updated_at"):
+        value.pop(field, None)
+    return value
+
+
+def _ai_entity_queryset(project, entity_type, model):
+    if entity_type in {"DiagramNode", "DiagramEdge"}:
+        return model.objects.filter(diagram__project=project)
+    return model.objects.filter(project=project)
+
+
+def _deep_merge_json(current, patch):
+    result = dict(current) if isinstance(current, dict) else {}
+    for key, value in patch.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = _deep_merge_json(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def _validate_ai_references(project, entity_type, data, instance=None):
+    if entity_type == "UmlPackage":
+        parent = data.get("parent")
+        if parent and parent.project_id != project.id:
+            raise ValueError("El paquete padre no pertenece al proyecto.")
+    elif entity_type == "UmlElement":
+        package = data.get("package")
+        if package and package.project_id != project.id:
+            raise ValueError("El paquete no pertenece al proyecto.")
+        metaclass = data.get("metaclass", getattr(instance, "metaclass", None))
+        name = data.get("name", getattr(instance, "name", None))
+        validation = validate_element(metaclass, name)
+        if not validation.valid:
+            raise ValueError("La propuesta contiene un elemento UML inválido.")
+    elif entity_type == "UmlRelationship":
+        source = data.get("source", getattr(instance, "source", None))
+        target = data.get("target", getattr(instance, "target", None))
+        relationship_type = data.get("relationship_type", getattr(instance, "relationship_type", None))
+        if not source or not target or source.project_id != project.id or target.project_id != project.id:
+            raise ValueError("Los extremos de la relación no pertenecen al proyecto.")
+        validation = validate_relationship(relationship_type, source, target)
+        if not validation.valid:
+            raise ValueError("La propuesta contiene una relación UML inválida.")
+    elif entity_type == "DiagramNode":
+        diagram = data.get("diagram", getattr(instance, "diagram", None))
+        element = data.get("element", getattr(instance, "element", None))
+        if not diagram or diagram.project_id != project.id:
+            raise ValueError("El nodo requiere un diagrama del proyecto.")
+        if element and element.project_id != project.id:
+            raise ValueError("El elemento del nodo no pertenece al proyecto.")
+    elif entity_type == "DiagramEdge":
+        diagram = data.get("diagram", getattr(instance, "diagram", None))
+        source = data.get("source_node", getattr(instance, "source_node", None))
+        target = data.get("target_node", getattr(instance, "target_node", None))
+        relationship = data.get("relationship", getattr(instance, "relationship", None))
+        if not diagram or diagram.project_id != project.id or not source or not target:
+            raise ValueError("El conector requiere diagrama, origen y destino válidos.")
+        if source.diagram_id != diagram.id or target.diagram_id != diagram.id:
+            raise ValueError("Los nodos del conector deben pertenecer al mismo diagrama.")
+        if relationship and relationship.project_id != project.id:
+            raise ValueError("La relación del conector no pertenece al proyecto.")
+
+
+def _apply_ai_mutation(project, user, operation):
+    entity_type = operation.get("entity_type")
+    action = operation.get("action")
+    if entity_type not in _AI_ENTITY_CONFIG or action not in {"create", "update", "delete"}:
+        raise ValueError("La propuesta contiene una operación no permitida.")
+    model, serializer_class, create_context = _AI_ENTITY_CONFIG[entity_type]
+    raw_value = operation.get("value", operation)
+    if not isinstance(raw_value, dict):
+        raise ValueError("El valor de la operación debe ser un objeto.")
+    value = _ai_operation_value(entity_type, raw_value)
+    raw_entity_id = operation.get("entity_id") or raw_value.get("id")
+    if action == "create":
+        try:
+            entity_id = uuid.UUID(str(raw_entity_id)) if raw_entity_id else uuid.uuid4()
+        except (ValueError, TypeError) as exc:
+            raise ValueError("El identificador de la entidad no es válido.") from exc
+        if model.objects.filter(pk=entity_id).exists():
+            raise ValueError("La entidad propuesta ya existe.")
+        serializer = serializer_class(data=value)
+        serializer.is_valid(raise_exception=True)
+        _validate_ai_references(project, entity_type, serializer.validated_data)
+        save_kwargs = {key: project if source == "project" else user for key, source in create_context.items()}
+        obj = serializer.save(id=entity_id, **save_kwargs)
+        return obj.id, None, _json_value(serializer_class(obj).data)
+
+    if not raw_entity_id:
+        raise ValueError("La operación requiere entity_id.")
+    try:
+        obj = _ai_entity_queryset(project, entity_type, model).get(pk=raw_entity_id)
+    except (model.DoesNotExist, ValueError, TypeError) as exc:
+        raise ValueError("La entidad que la IA intenta cambiar no existe.") from exc
+    previous = _json_value(serializer_class(obj).data)
+    entity_id = obj.id
+    if action == "delete":
+        obj.delete()
+        return entity_id, previous, None
+
+    # Path-based AI proposals may update one key inside a JSON field. Preserve
+    # presentation metadata and any unrelated values already stored there.
+    for json_field in ("properties", "external_ids"):
+        patch = value.get(json_field)
+        current = getattr(obj, json_field, None)
+        if isinstance(patch, dict) and isinstance(current, dict):
+            value[json_field] = _deep_merge_json(current, patch)
+
+    serializer = serializer_class(obj, data=value, partial=True)
+    serializer.is_valid(raise_exception=True)
+    _validate_ai_references(project, entity_type, serializer.validated_data, instance=obj)
+    serializer.save()
+    return entity_id, previous, _json_value(serializer.data)
 
 
 @api_view(["POST"])
@@ -715,40 +944,61 @@ def ai_apply(request, project_id, proposal_id):
     except AiProposal.DoesNotExist as exc:
         from rest_framework.exceptions import NotFound
         raise NotFound("Propuesta de IA no encontrada o ya aplicada.") from exc
+    try:
+        normalized_proposal = validate_proposal(item.proposal, context=item.context, prompt=item.prompt)
+    except AiProviderError as exc:
+        return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+    if normalized_proposal.get("questions"):
+        return Response(
+            {"detail": "La propuesta todavía contiene preguntas por resolver."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if any(item.get("severity") == "error" for item in normalized_proposal.get("diagnostics", []) if isinstance(item, dict)):
+        return Response(
+            {"detail": "La propuesta contiene errores de validación."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    has_selection = "operation_ids" in request.data
     selected = set(request.data.get("operation_ids") or [])
-    operations = item.proposal.get("operations", [])
+    operations = normalized_proposal.get("operations", [])
+    if has_selection and not selected:
+        return Response({"detail": "Selecciona al menos una operación."}, status=status.HTTP_400_BAD_REQUEST)
     if selected:
+        known_ids = {str(operation.get("id")) for operation in operations}
+        if not selected.issubset(known_ids):
+            return Response({"detail": "La selección contiene operaciones desconocidas."}, status=status.HTTP_400_BAD_REQUEST)
         operations = [operation for operation in operations if str(operation.get("id")) in selected]
+    selected_ids = {str(operation.get("id")) for operation in operations}
+    for operation in operations:
+        missing = set(operation.get("depends_on") or []) - selected_ids
+        if missing:
+            return Response({"detail": f"Faltan dependencias para la operación {operation.get('id')}: {', '.join(sorted(missing))}."}, status=status.HTTP_400_BAD_REQUEST)
     if len(operations) > int(getattr(settings, "AI_MAX_OPERATIONS", 200)):
         return Response({"detail": "La propuesta supera el límite de operaciones."}, status=status.HTTP_400_BAD_REQUEST)
-    snapshot = snapshot_project(project, reason="before_ai", created_by=request.user)
     created = []
-    with transaction.atomic():
-        for operation in operations:
-            entity_type = operation.get("entity_type", "unknown")
-            action = operation.get("action", "propose")
-            value = operation.get("value", operation)
-            entity_id = operation.get("entity_id")
-            if action == "create" and isinstance(value, dict):
-                if entity_type == "UmlPackage":
-                    obj = UmlPackage.objects.create(project=project, name=value.get("name", "Paquete"), mda_level=value.get("mda_level", Project.MdaLevel.UNSPECIFIED), properties=value.get("properties") or {})
-                    entity_id = obj.id
-                elif entity_type == "UmlElement":
-                    validation = validate_element(value.get("metaclass"), value.get("name"))
-                    if not validation.valid:
-                        raise ValueError("La propuesta contiene un elemento UML inválido.")
-                    obj = UmlElement.objects.create(project=project, created_by=request.user, metaclass=value["metaclass"], name=value["name"], properties=value.get("properties") or {}, external_ids=value.get("external_ids") or {})
-                    entity_id = obj.id
-                elif entity_type == "Diagram":
-                    obj = Diagram.objects.create(project=project, created_by=request.user, name=value.get("name", "Diagrama"), diagram_type=value.get("diagram_type", "class"), properties=value.get("properties") or {})
-                    entity_id = obj.id
-            try:
-                parsed_entity_id = uuid.UUID(str(entity_id)) if entity_id else None
-            except (ValueError, TypeError):
-                parsed_entity_id = None
-            created.append(record_operation(project_id=project.id, author=request.user, origin=ModelOperation.Origin.AI, entity_type=entity_type, entity_id=parsed_entity_id, action=action, path=operation.get("path", ""), new_value=value, base_revision=project.revision))
-        item.status = AiProposal.Status.APPLIED
-        item.save(update_fields=("status", "updated_at"))
+    try:
+        with transaction.atomic():
+            snapshot = snapshot_project(project, reason="before_ai", created_by=request.user)
+            base_revision = int(item.context.get("project", {}).get("revision", project.revision))
+            for operation in operations:
+                entity_id, previous, current = _apply_ai_mutation(project, request.user, operation)
+                created.append(record_operation(
+                    project_id=project.id,
+                    author=request.user,
+                    origin=ModelOperation.Origin.AI,
+                    entity_type=operation["entity_type"],
+                    entity_id=entity_id,
+                    action=operation["action"],
+                    path=operation.get("path", ""),
+                    previous_value=previous,
+                    new_value=current,
+                    base_revision=base_revision,
+                ))
+            item.status = AiProposal.Status.APPLIED
+            item.proposal = normalized_proposal
+            item.save(update_fields=("proposal", "status", "updated_at"))
+    except ValueError as exc:
+        return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
     project.refresh_from_db(fields=("revision",))
     return Response({"proposal_id": str(item.id), "snapshot_id": str(snapshot.id), "operations": OperationSerializer(created, many=True).data, "revision": project.revision})
 

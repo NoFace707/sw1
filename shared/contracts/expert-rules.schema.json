@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sw1.local/contracts/expert-rules.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "version", "registry_version", "rules", "checksum"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "version": {"type": "string", "minLength": 1},
+    "registry_version": {"type": "string", "minLength": 1},
+    "checksum": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "rules": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "category", "scope", "severity", "condition", "message", "evidence", "question", "repair", "mapping"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "category": {"enum": ["identity", "uml_types", "uml_relations", "mda_traceability", "permissions", "limits", "spring_mapping"]},
+          "scope": {"type": "string", "minLength": 1},
+          "severity": {"enum": ["error", "warning", "info"]},
+          "condition": {"type": "object", "required": ["operator"]},
+          "message": {"type": "string", "minLength": 1},
+          "evidence": {"type": "object"},
+          "question": {"type": ["string", "null"]},
+          "repair": {"type": ["object", "null"]},
+          "mapping": {"type": "object"}
+        }
+      }
+    }
+  }
+}

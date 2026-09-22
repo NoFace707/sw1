@@ -4,7 +4,7 @@ import 'package:flutter/material.dart';
 
 enum ProjectAccess { owner, editor, viewer }
 
-enum ViewerSyncState { updated, offline, pending, conflict }
+enum ViewerSyncState { updated, offline, syncing, pending, conflict }
 
 ProjectAccess projectAccessFromJson(Object? value) => switch (value) {
   'owner' => ProjectAccess.owner,
@@ -14,6 +14,7 @@ ProjectAccess projectAccessFromJson(Object? value) => switch (value) {
 
 ViewerSyncState viewerSyncStateFromJson(Object? value) => switch (value) {
   'offline' => ViewerSyncState.offline,
+  'syncing' => ViewerSyncState.syncing,
   'pending' => ViewerSyncState.pending,
   'conflict' => ViewerSyncState.conflict,
   _ => ViewerSyncState.updated,
@@ -288,13 +289,21 @@ class UmlSnapshot {
     final projectJson = _map(payload['project']).isNotEmpty
         ? _map(payload['project'])
         : fallbackProject?.toJson() ?? const <String, dynamic>{};
+    final storedSyncState = viewerSyncStateFromJson(
+      '${projectJson['sync_state'] ?? fallbackProject?.syncState.name ?? 'updated'}',
+    );
+    final visibleSyncState = loadedFromOffline
+        ? switch (storedSyncState) {
+            ViewerSyncState.pending ||
+            ViewerSyncState.conflict => storedSyncState,
+            _ => ViewerSyncState.offline,
+          }
+        : fallbackProject?.syncState ?? storedSyncState;
     final project = UmlProjectSummary.fromJson({
       ...projectJson,
       if (fallbackProject != null) ...fallbackProject.toJson(),
       if (json['revision'] != null) 'revision': json['revision'],
-      'sync_state': loadedFromOffline
-          ? 'offline'
-          : (fallbackProject?.syncState.name ?? 'updated'),
+      'sync_state': visibleSyncState.name,
       'available_offline':
           loadedFromOffline || fallbackProject?.availableOffline == true,
     });

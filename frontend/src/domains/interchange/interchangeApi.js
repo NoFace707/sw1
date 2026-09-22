@@ -17,11 +17,12 @@ export async function downloadInterchange(projectId, profile) {
   return response.blob();
 }
 
-export function previewInterchange(projectId, file, profile, mode = "update") {
+export function previewInterchange(projectId, file, profile, mode = "update", targetDiagramId = null) {
   const form = new FormData();
   form.append("file", file);
   form.append("profile", profile);
   form.append("preview", "true");
   form.append("mode", mode);
+  if (targetDiagramId) form.append("target_diagram_id", targetDiagramId);
   return requestJsonWithAuthRetry(`/api/modeling/projects/${projectId}/interchange/import/`, { method: "POST", body: form });
 }

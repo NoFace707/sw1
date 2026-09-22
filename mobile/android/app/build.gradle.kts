@@ -25,10 +25,18 @@ android {
         applicationId = "com.example.mobile"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
-        minSdk = flutter.minSdkVersion
+        // El AAR oficial de llama_cpp_dart usa APIs disponibles desde
+        // Android 8.0. Mantenerlo explícito evita APK que compilan pero fallan
+        // al cargar el runtime nativo.
+        minSdk = 26
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+        ndk {
+            // El runtime oficial fijado de llama.cpp se distribuye para
+            // Android arm64. Evita instalar un APK local-AI incompatible.
+            abiFilters += listOf("arm64-v8a")
+        }
     }
 
     buildTypes {
@@ -50,4 +58,5 @@ flutter {
 
 dependencies {
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")
+    implementation(files("libs/llama-cpp-dart.aar"))
 }

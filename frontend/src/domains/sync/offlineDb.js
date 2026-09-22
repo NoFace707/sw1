@@ -40,6 +40,28 @@ export async function clearUserOfflineData(userId) {
   ]);
 }
 
+export async function deleteCachedProjectData(userId, projectId) {
+  const normalizedUserId = String(userId);
+  const normalizedProjectId = String(projectId);
+  return runStorage(() => offlineDb.transaction(
+    "rw",
+    offlineDb.projects,
+    offlineDb.snapshots,
+    offlineDb.operations,
+    offlineDb.conflicts,
+    offlineDb.promptDrafts,
+    async () => {
+      await Promise.all([
+        offlineDb.projects.delete([normalizedUserId, normalizedProjectId]),
+        offlineDb.snapshots.delete([normalizedUserId, normalizedProjectId]),
+        offlineDb.operations.where({ userId: normalizedUserId, projectId: normalizedProjectId }).delete(),
+        offlineDb.conflicts.where({ userId: normalizedUserId, projectId: normalizedProjectId }).delete(),
+        offlineDb.promptDrafts.delete([normalizedUserId, normalizedProjectId]),
+      ]);
+    },
+  ));
+}
+
 export async function queueOperation(operation) {
   return runStorage(() => offlineDb.operations.put({ ...operation, status: "pending", queuedAt: Date.now() }));
 }

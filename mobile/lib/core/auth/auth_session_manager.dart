@@ -83,6 +83,19 @@ class AuthSessionManager {
     return value == null || value.isEmpty ? null : value;
   }
 
+  static Future<String?> refreshAccessToken({AuthService? authService}) async {
+    final preferences = await SharedPreferences.getInstance();
+    final refresh = (preferences.getString(_keyRefresh) ?? '').trim();
+    if (refresh.isEmpty) return null;
+    try {
+      final access = await (authService ?? AuthService()).refreshToken(refresh);
+      await preferences.setString(_keyAccess, access);
+      return access;
+    } catch (_) {
+      return null;
+    }
+  }
+
   static Future<void> logoutAndClear({AuthService? authService}) async {
     final service = authService ?? AuthService();
     final access = await getAccessToken();

@@ -70,3 +70,13 @@ La aplicación SHALL enviar a cada motor solo el diagrama, selección y referenc
 - **WHEN** el usuario pide modificar un elemento seleccionado
 - **THEN** el prompt contiene ese submodelo y dependencias requeridas, no el repositorio completo
 
+### Requirement: Dictado móvil mediante Whisper compartido
+La aplicación SHALL permitir grabar una instrucción con el micrófono en Android e iOS y SHALL usar el endpoint autenticado compartido para transcribirla con Whisper local en el backend sin una clave externa obligatoria. El audio SHALL ser temporal, MUST eliminarse después del intento y el texto MUST poder editarse antes de enviarlo a cualquier motor de IA.
+
+#### Scenario: Dictar una instrucción
+- **WHEN** el usuario concede permiso, graba y detiene el audio mientras tiene conexión
+- **THEN** la aplicación muestra el estado de transcripción e inserta el texto resultante en el campo del chat sin crear ni aplicar una propuesta
+
+#### Scenario: Dictado sin conexión o permiso
+- **WHEN** no existe conexión, se deniega el micrófono o falla la transcripción
+- **THEN** la aplicación conserva el texto previo, informa el problema y mantiene disponibles la escritura y las capacidades locales

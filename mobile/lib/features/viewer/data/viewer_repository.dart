@@ -1,9 +1,16 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+
+import 'package:http/http.dart' as http;
 
 import '../../../core/auth/auth_session_manager.dart';
 import '../../../core/config/app_config.dart';
 import '../../../core/network/api_client.dart';
+import '../../offline/data/connectivity_service.dart';
+import '../../offline/data/drift_viewer_replica_store.dart';
+import '../../offline/domain/viewer_replica_store.dart';
+import '../../ai/domain/mobile_ai.dart';
 import '../domain/viewer_models.dart';
 
 abstract class ViewerRepository {
@@ -17,35 +24,17 @@ abstract class ViewerRepository {
   Stream<int> watchRemoteRevisions(String projectId) => const Stream.empty();
 }
 
-abstract class ViewerReplicaStore {
-  Future<List<UmlProjectSummary>> loadProjects(String userId);
-  Future<void> saveProjects(String userId, List<UmlProjectSummary> projects);
-  Future<bool> hasSnapshot(String userId, String projectId);
-  Future<UmlSnapshot?> loadSnapshot(String userId, String projectId);
-  Future<void> saveSnapshot(String userId, UmlSnapshot snapshot);
-}
+abstract class OfflineCapableViewerRepository {
+  Future<UmlProjectSummary> setOfflineAvailability(
+    UmlProjectSummary project,
+    bool enabled,
+  );
 
-class EmptyViewerReplicaStore implements ViewerReplicaStore {
-  const EmptyViewerReplicaStore();
+  Future<int> offlineProjectBytes();
 
-  @override
-  Future<bool> hasSnapshot(String userId, String projectId) async => false;
+  Stream<MobileConnectivityState> watchConnectivity();
 
-  @override
-  Future<List<UmlProjectSummary>> loadProjects(String userId) async => const [];
-
-  @override
-  Future<UmlSnapshot?> loadSnapshot(String userId, String projectId) async =>
-      null;
-
-  @override
-  Future<void> saveProjects(
-    String userId,
-    List<UmlProjectSummary> projects,
-  ) async {}
-
-  @override
-  Future<void> saveSnapshot(String userId, UmlSnapshot snapshot) async {}
+  Future<void> close();
 }
 
 class ViewerRepositoryException implements Exception {
@@ -60,24 +49,38 @@ class ViewerRepositoryException implements Exception {
   String toString() => message;
 }
 
-class MobileViewerRepository implements ViewerRepository {
+class MobileViewerRepository
+    implements ViewerRepository, OfflineCapableViewerRepository {
   MobileViewerRepository({
     required this.userId,
     ApiClient? apiClient,
     Future<String?> Function()? accessTokenProvider,
+    Future<String?> Function()? accessTokenRefresher,
     ViewerReplicaStore? replicaStore,
+    ConnectivityService? connectivityService,
   }) : _apiClient = apiClient ?? ApiClient(),
        _accessTokenProvider =
            accessTokenProvider ?? AuthSessionManager.getAccessToken,
-       _replicaStore = replicaStore ?? const EmptyViewerReplicaStore();
+       _accessTokenRefresher =
+           accessTokenRefresher ?? AuthSessionManager.refreshAccessToken,
+       _replicaStore = replicaStore ?? DriftViewerReplicaStore(),
+       _connectivityService =
+           connectivityService ?? DeviceConnectivityService();
 
   final String userId;
   final ApiClient _apiClient;
   final Future<String?> Function() _accessTokenProvider;
+  final Future<String?> Function()? _accessTokenRefresher;
   final ViewerReplicaStore _replicaStore;
+  final ConnectivityService _connectivityService;
 
   @override
   Future<List<UmlProjectSummary>> loadProjects({bool refresh = true}) async {
+    if (refresh &&
+        await _connectivityService.current() ==
+            MobileConnectivityState.offline) {
+      refresh = false;
+    }
     if (refresh) {
       try {
         final token = await _requiredToken();
@@ -120,7 +123,15 @@ class MobileViewerRepository implements ViewerRepository {
       }
     }
     final cached = (await _replicaStore.loadProjects(userId))
-        .map((project) => project.copyWith(syncState: ViewerSyncState.offline))
+        .map(
+          (project) => project.copyWith(
+            syncState: switch (project.syncState) {
+              ViewerSyncState.pending ||
+              ViewerSyncState.conflict => project.syncState,
+              _ => ViewerSyncState.offline,
+            },
+          ),
+        )
         .toList(growable: false);
     if (cached.isNotEmpty) return cached;
     throw const ViewerRepositoryException(
@@ -133,7 +144,10 @@ class MobileViewerRepository implements ViewerRepository {
     UmlProjectSummary project, {
     bool preferRemote = true,
   }) async {
-    if (preferRemote) {
+    final canUseRemote =
+        preferRemote &&
+        await _connectivityService.current() == MobileConnectivityState.online;
+    if (canUseRemote) {
       try {
         final snapshot = await _loadRemoteSnapshot(project);
         await _replicaStore.saveSnapshot(userId, snapshot);
@@ -226,6 +240,161 @@ class MobileViewerRepository implements ViewerRepository {
       },
     }, fallbackProject: project);
   }
+
+  @override
+  Future<UmlProjectSummary> setOfflineAvailability(
+    UmlProjectSummary project,
+    bool enabled,
+  ) async {
+    if (!enabled) {
+      await _replicaStore.removeOfflineBundle(userId, project.id);
+      return project.copyWith(
+        availableOffline: false,
+        syncState: ViewerSyncState.updated,
+      );
+    }
+
+    final token = await _requiredToken();
+    final snapshotFuture = _loadRemoteSnapshot(project);
+    final registryFuture = _apiClient.get(
+      '/api/modeling/registry/',
+      accessToken: token,
+    );
+    final rulesFuture = _apiClient.get(
+      '/api/modeling/expert-rules/',
+      accessToken: token,
+    );
+    final snapshot = await snapshotFuture;
+    final registryResponse = await registryFuture;
+    final rulesResponse = await rulesFuture;
+    if (registryResponse.statusCode < 200 ||
+        registryResponse.statusCode >= 300 ||
+        rulesResponse.statusCode < 200 ||
+        rulesResponse.statusCode >= 300) {
+      throw const ViewerRepositoryException(
+        'No se pudieron descargar el registro UML y las reglas offline.',
+      );
+    }
+    final registry = _jsonMap(_decode(registryResponse.bodyBytes));
+    final rules = _jsonMap(_decode(rulesResponse.bodyBytes));
+    if (registry['version'] == null ||
+        rules['version'] == null ||
+        rules['registry_version'] != registry['version']) {
+      throw const ViewerRepositoryException(
+        'El registro UML y las reglas offline no son compatibles.',
+      );
+    }
+    await _replicaStore.saveOfflineBundle(userId, snapshot, registry, rules);
+    return project.copyWith(
+      availableOffline: true,
+      revision: snapshot.project.revision,
+      syncState: ViewerSyncState.updated,
+    );
+  }
+
+  @override
+  Future<int> offlineProjectBytes() => _replicaStore.projectBytes(userId);
+
+  Future<Map<String, dynamic>?> loadOfflineRules(String projectId) =>
+      _replicaStore.loadRules(userId, projectId);
+
+  Future<Map<String, dynamic>?> loadOfflineRegistry(String projectId) =>
+      _replicaStore.loadRegistry(userId, projectId);
+
+  Future<bool> isOnline() async =>
+      await _connectivityService.current() == MobileConnectivityState.online;
+
+  Future<void> saveLocalProposal(String projectId, MobileAiResponse proposal) =>
+      _replicaStore.saveLocalProposal(userId, projectId, proposal);
+
+  Future<UmlSnapshot> confirmLocalProposal(
+    String projectId,
+    MobileAiResponse proposal,
+    Iterable<String> selectedOperationIds,
+  ) => _replicaStore.confirmLocalProposal(
+    userId,
+    projectId,
+    proposal,
+    selectedOperationIds,
+  );
+
+  Future<UmlSnapshot> applyRemoteAiProposal(
+    UmlProjectSummary project,
+    MobileAiResponse proposal,
+    Iterable<String> selectedOperationIds,
+  ) async {
+    if (proposal.id.trim().isEmpty) {
+      throw const ViewerRepositoryException(
+        'La propuesta remota no tiene un identificador válido.',
+      );
+    }
+    final selected = selectedOperationIds.toSet();
+    if (selected.isEmpty) {
+      throw const ViewerRepositoryException(
+        'Selecciona al menos un cambio antes de confirmar.',
+      );
+    }
+    late final http.Response response;
+    try {
+      response = await _postAuthorized(
+        '/api/modeling/projects/${project.id}/ai/proposals/${proposal.id}/apply/',
+        body: {'operation_ids': selected.toList(growable: false)},
+        timeout: const Duration(seconds: 30),
+      );
+    } on TimeoutException {
+      throw const ViewerRepositoryException(
+        'El servidor tardó demasiado en aplicar la propuesta. Actualiza el proyecto antes de reintentar para comprobar si fue confirmada.',
+      );
+    }
+    final payload = _jsonMap(_decode(response.bodyBytes));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw ViewerRepositoryException(
+        '${payload['detail'] ?? 'No se pudo aplicar la propuesta de IA.'}',
+      );
+    }
+    final snapshot = await _loadRemoteSnapshot(project);
+    await _replicaStore.saveSnapshot(userId, snapshot);
+    return snapshot;
+  }
+
+  Future<http.Response> _postAuthorized(
+    String path, {
+    required Map<String, dynamic> body,
+    Duration? timeout,
+  }) async {
+    var token = await _requiredToken();
+    var response = await _apiClient.post(
+      path,
+      accessToken: token,
+      body: body,
+      timeout: timeout,
+    );
+    final refresher = _accessTokenRefresher;
+    if (response.statusCode != 401 || refresher == null) {
+      return response;
+    }
+    token = (await refresher()) ?? '';
+    if (token.isEmpty) {
+      throw const ViewerRepositoryException(
+        'La sesión venció. Inicia sesión nuevamente para confirmar cambios.',
+      );
+    }
+    response = await _apiClient.post(
+      path,
+      accessToken: token,
+      body: body,
+      timeout: timeout,
+    );
+    return response;
+  }
+
+  @override
+  Stream<MobileConnectivityState> watchConnectivity() {
+    return _connectivityService.watch();
+  }
+
+  @override
+  Future<void> close() => _replicaStore.close();
 
   @override
   Stream<int> watchRemoteRevisions(String projectId) async* {

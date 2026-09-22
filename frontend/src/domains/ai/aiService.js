@@ -16,6 +16,16 @@ export function applyAiProposal(projectId, proposalId, operationIds) {
   });
 }
 
+export function transcribeAiAudio(projectId, audioBlob, filename = "instruction.webm") {
+  const body = new FormData();
+  body.append("audio", audioBlob, filename);
+  body.append("language", "es");
+  return requestJsonWithAuthRetry(`/api/modeling/projects/${projectId}/ai/transcriptions/`, {
+    method: "POST",
+    body,
+  });
+}
+
 export function explainWithAi(projectId, payload) {
   return requestJsonWithAuthRetry(`/api/modeling/projects/${projectId}/ai/explain/`, {
     method: "POST",
